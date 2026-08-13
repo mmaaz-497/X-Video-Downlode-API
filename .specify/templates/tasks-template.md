@@ -8,7 +8,10 @@ description: "Task list template for feature implementation"
 **Input**: Design documents from `/specs/[###-feature-name]/`
 **Prerequisites**: plan.md (required), spec.md (required for user stories), research.md, data-model.md, contracts/
 
-**Tests**: The examples below include test tasks. Tests are OPTIONAL - only include them if explicitly requested in the feature specification.
+**Tests**: Per Constitution Principle II (Minimal Testing), test tasks are the exception, not the
+default. Include a test task ONLY for URL validation or the extractor wrapper. Do not generate
+contract tests, network-dependent integration tests, or mock-based tests. Manual CLI
+verification is the primary validation method — make it an explicit task instead.
 
 **Organization**: Tasks are grouped by user story to enable independent implementation and testing of each story.
 
@@ -20,10 +23,10 @@ description: "Task list template for feature implementation"
 
 ## Path Conventions
 
-- **Single project**: `src/`, `tests/` at repository root
-- **Web app**: `backend/src/`, `frontend/src/`
-- **Mobile**: `api/src/`, `ios/src/` or `android/src/`
-- Paths shown below assume single project - adjust based on plan.md structure
+- All application code lives in `backend/` (Constitution Principle I). There is no `src/`,
+  `frontend/`, or `api/` directory.
+- The permitted tests live in `tests/` at the repository root.
+- Sample tasks below use generic paths; rewrite them as real `backend/*.py` paths.
 
 <!-- 
   ============================================================================
@@ -60,14 +63,14 @@ description: "Task list template for feature implementation"
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-Examples of foundational tasks (adjust based on your project):
+Examples of foundational tasks for this project (no databases, queues, ORMs, or auth
+frameworks — see Constitution Principle IV):
 
-- [ ] T004 Setup database schema and migrations framework
-- [ ] T005 [P] Implement authentication/authorization framework
-- [ ] T006 [P] Setup API routing and middleware structure
-- [ ] T007 Create base models/entities that all stories depend on
-- [ ] T008 Configure error handling and logging infrastructure
-- [ ] T009 Setup environment configuration management
+- [ ] T004 Implement URL host allowlist validation in backend/validation.py
+- [ ] T005 [P] Implement output filename sanitization and path containment in backend/validation.py
+- [ ] T006 [P] Load configuration from environment variables with defaults in backend/config.py
+- [ ] T007 Wrap yt-dlp (as a library) in backend/downloader.py
+- [ ] T008 Wire the CLI entrypoint in backend/cli.py
 
 **Checkpoint**: Foundation ready - user story implementation can now begin in parallel
 
@@ -79,21 +82,21 @@ Examples of foundational tasks (adjust based on your project):
 
 **Independent Test**: [How to verify this story works on its own]
 
-### Tests for User Story 1 (OPTIONAL - only if tests requested) ⚠️
+### Verification for User Story 1
 
-> **NOTE: Write these tests FIRST, ensure they FAIL before implementation**
+> **NOTE: Manual CLI verification is the default (Principle II). Add a test task only if this
+> story touches URL validation or the extractor wrapper.**
 
-- [ ] T010 [P] [US1] Contract test for [endpoint] in tests/contract/test_[name].py
-- [ ] T011 [P] [US1] Integration test for [user journey] in tests/integration/test_[name].py
+- [ ] T010 [US1] Manually verify via CLI: [exact command and expected output]
+- [ ] T011 [P] [US1] (Only if applicable) Test for URL validation / extractor wrapper in tests/test_[name].py
 
 ### Implementation for User Story 1
 
-- [ ] T012 [P] [US1] Create [Entity1] model in src/models/[entity1].py
-- [ ] T013 [P] [US1] Create [Entity2] model in src/models/[entity2].py
-- [ ] T014 [US1] Implement [Service] in src/services/[service].py (depends on T012, T013)
-- [ ] T015 [US1] Implement [endpoint/feature] in src/[location]/[file].py
-- [ ] T016 [US1] Add validation and error handling
-- [ ] T017 [US1] Add logging for user story 1 operations
+- [ ] T012 [P] [US1] Add [helper] in backend/validation.py
+- [ ] T013 [P] [US1] Add [setting] in backend/config.py
+- [ ] T014 [US1] Implement [capability] in backend/downloader.py (depends on T012, T013)
+- [ ] T015 [US1] Expose [capability] as a CLI command in backend/cli.py
+- [ ] T016 [US1] Add fail-fast error messages using built-in exceptions (Principle VI)
 
 **Checkpoint**: At this point, User Story 1 should be fully functional and testable independently
 
@@ -105,16 +108,15 @@ Examples of foundational tasks (adjust based on your project):
 
 **Independent Test**: [How to verify this story works on its own]
 
-### Tests for User Story 2 (OPTIONAL - only if tests requested) ⚠️
+### Verification for User Story 2
 
-- [ ] T018 [P] [US2] Contract test for [endpoint] in tests/contract/test_[name].py
-- [ ] T019 [P] [US2] Integration test for [user journey] in tests/integration/test_[name].py
+- [ ] T018 [US2] Manually verify via CLI: [exact command and expected output]
 
 ### Implementation for User Story 2
 
-- [ ] T020 [P] [US2] Create [Entity] model in src/models/[entity].py
-- [ ] T021 [US2] Implement [Service] in src/services/[service].py
-- [ ] T022 [US2] Implement [endpoint/feature] in src/[location]/[file].py
+- [ ] T020 [P] [US2] Add [helper] in backend/[module].py
+- [ ] T021 [US2] Implement [capability] in backend/downloader.py
+- [ ] T022 [US2] Expose [capability] as a CLI command in backend/cli.py
 - [ ] T023 [US2] Integrate with User Story 1 components (if needed)
 
 **Checkpoint**: At this point, User Stories 1 AND 2 should both work independently
@@ -127,16 +129,15 @@ Examples of foundational tasks (adjust based on your project):
 
 **Independent Test**: [How to verify this story works on its own]
 
-### Tests for User Story 3 (OPTIONAL - only if tests requested) ⚠️
+### Verification for User Story 3
 
-- [ ] T024 [P] [US3] Contract test for [endpoint] in tests/contract/test_[name].py
-- [ ] T025 [P] [US3] Integration test for [user journey] in tests/integration/test_[name].py
+- [ ] T024 [US3] Manually verify via CLI: [exact command and expected output]
 
 ### Implementation for User Story 3
 
-- [ ] T026 [P] [US3] Create [Entity] model in src/models/[entity].py
-- [ ] T027 [US3] Implement [Service] in src/services/[service].py
-- [ ] T028 [US3] Implement [endpoint/feature] in src/[location]/[file].py
+- [ ] T026 [P] [US3] Add [helper] in backend/[module].py
+- [ ] T027 [US3] Implement [capability] in backend/downloader.py
+- [ ] T028 [US3] Expose [capability] as a CLI command in backend/cli.py
 
 **Checkpoint**: All user stories should now be independently functional
 
@@ -150,11 +151,10 @@ Examples of foundational tasks (adjust based on your project):
 
 **Purpose**: Improvements that affect multiple user stories
 
-- [ ] TXXX [P] Documentation updates in docs/
-- [ ] TXXX Code cleanup and refactoring
-- [ ] TXXX Performance optimization across all stories
-- [ ] TXXX [P] Additional unit tests (if requested) in tests/unit/
-- [ ] TXXX Security hardening
+- [ ] TXXX [P] Documentation updates (README, .env.example)
+- [ ] TXXX Code cleanup — remove dead code, do not add abstractions
+- [ ] TXXX Re-check Principle V: host allowlist, no shell input, path containment
+- [ ] TXXX Confirm the app starts on a plain Linux VPS with env-var defaults only
 - [ ] TXXX Run quickstart.md validation
 
 ---
@@ -178,33 +178,26 @@ Examples of foundational tasks (adjust based on your project):
 
 ### Within Each User Story
 
-- Tests (if included) MUST be written and FAIL before implementation
-- Models before services
-- Services before endpoints
-- Core implementation before integration
+- Validation helpers before the logic that calls them (Principle V)
+- Core module before CLI wiring; CLI before any HTTP layer (Principle III)
+- Manual CLI verification closes the story
 - Story complete before moving to next priority
 
 ### Parallel Opportunities
 
 - All Setup tasks marked [P] can run in parallel
 - All Foundational tasks marked [P] can run in parallel (within Phase 2)
-- Once Foundational phase completes, all user stories can start in parallel (if team capacity allows)
-- All tests for a user story marked [P] can run in parallel
-- Models within a story marked [P] can run in parallel
-- Different user stories can be worked on in parallel by different team members
+- Tasks touching different `backend/` modules can run in parallel
+- Note: this is a single-developer project — [P] marks independence, not staffing
 
 ---
 
 ## Parallel Example: User Story 1
 
 ```bash
-# Launch all tests for User Story 1 together (if tests requested):
-Task: "Contract test for [endpoint] in tests/contract/test_[name].py"
-Task: "Integration test for [user journey] in tests/integration/test_[name].py"
-
-# Launch all models for User Story 1 together:
-Task: "Create [Entity1] model in src/models/[entity1].py"
-Task: "Create [Entity2] model in src/models/[entity2].py"
+# Tasks touching different backend/ modules can run together:
+Task: "Implement URL host allowlist in backend/validation.py"
+Task: "Load configuration from environment variables in backend/config.py"
 ```
 
 ---
@@ -227,25 +220,14 @@ Task: "Create [Entity2] model in src/models/[entity2].py"
 4. Add User Story 3 → Test independently → Deploy/Demo
 5. Each story adds value without breaking previous stories
 
-### Parallel Team Strategy
-
-With multiple developers:
-
-1. Team completes Setup + Foundational together
-2. Once Foundational is done:
-   - Developer A: User Story 1
-   - Developer B: User Story 2
-   - Developer C: User Story 3
-3. Stories complete and integrate independently
-
 ---
 
 ## Notes
 
 - [P] tasks = different files, no dependencies
 - [Story] label maps task to specific user story for traceability
-- Each user story should be independently completable and testable
-- Verify tests fail before implementing
+- Each user story should be independently completable and verifiable from the CLI
+- Prefer fewer files; extend an existing `backend/` module before creating a new one
 - Commit after each task or logical group
 - Stop at any checkpoint to validate story independently
 - Avoid: vague tasks, same file conflicts, cross-story dependencies that break independence

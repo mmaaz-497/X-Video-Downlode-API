@@ -31,7 +31,23 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+Answer each gate. Any "no" must be removed or justified in Complexity Tracking below.
+
+- [ ] **I. Single Backend Folder** — all new code lands under `backend/`; no new top-level
+      packages, services, or frontend directories.
+- [ ] **II. Minimal Testing** — tests planned only for URL validation and the extractor
+      wrapper; no network-dependent tests, no mocking frameworks, no TDD gate.
+- [ ] **III. CLI-First, API-Later** — the capability is reachable from the CLI; business logic
+      sits in a framework-free module, not in an HTTP handler.
+- [ ] **IV. Lean Dependencies** — no new dependency beyond Python 3.11+/uv/yt-dlp (as a
+      library)/ffmpeg; no DB, queue, ORM, or auth library unless the user asked for it.
+- [ ] **V. Security Baseline (NON-NEGOTIABLE)** — user URLs are host-allowlisted against
+      x.com/twitter.com before reaching an extractor; no shell interpolation; output filenames
+      sanitized and confined to the output directory.
+- [ ] **VI. Simple Errors** — built-in exceptions with clear messages; no custom hierarchy; no
+      speculative retry/backoff.
+- [ ] **VII. VPS-Deployable** — runs on a plain Linux VPS; configuration via environment
+      variables with sane defaults; no cloud-provider-specific services.
 
 ## Project Structure
 
@@ -49,50 +65,25 @@ specs/[###-feature]/
 
 ### Source Code (repository root)
 <!--
-  ACTION REQUIRED: Replace the placeholder tree below with the concrete layout
-  for this feature. Delete unused options and expand the chosen structure with
-  real paths (e.g., apps/admin, packages/something). The delivered plan must
-  not include Option labels.
+  The layout below is FIXED by Constitution Principle I (Single Backend Folder).
+  Extend it with the concrete files this feature adds; do not introduce new
+  top-level directories or alternative structures.
 -->
 
 ```text
-# [REMOVE IF UNUSED] Option 1: Single project (DEFAULT)
-src/
-├── models/
-├── services/
-├── cli/
-└── lib/
+backend/            # all application code
+├── cli.py          # terminal entrypoint
+├── downloader.py   # core download logic, framework-free
+├── validation.py   # URL allowlist and filename sanitization
+├── config.py       # environment variable loading with defaults
+└── [new modules this feature adds]
 
-tests/
-├── contract/
-├── integration/
-└── unit/
-
-# [REMOVE IF UNUSED] Option 2: Web application (when "frontend" + "backend" detected)
-backend/
-├── src/
-│   ├── models/
-│   ├── services/
-│   └── api/
-└── tests/
-
-frontend/
-├── src/
-│   ├── components/
-│   ├── pages/
-│   └── services/
-└── tests/
-
-# [REMOVE IF UNUSED] Option 3: Mobile + API (when "iOS/Android" detected)
-api/
-└── [same as backend above]
-
-ios/ or android/
-└── [platform-specific structure: feature modules, UI flows, platform tests]
+tests/              # only URL validation + extractor wrapper (Principle II)
 ```
 
-**Structure Decision**: [Document the selected structure and reference the real
-directories captured above]
+**Structure Decision**: Single `backend/` package per Principle I. List the exact files this
+feature creates or modifies above. Adding a top-level directory requires a Complexity Tracking
+entry.
 
 ## Complexity Tracking
 

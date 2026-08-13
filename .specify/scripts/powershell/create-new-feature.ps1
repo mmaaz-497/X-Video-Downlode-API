@@ -264,7 +264,8 @@ if (Test-Path $template) {
 
 # Auto-create history/prompts/<branch-name>/ directory (same as specs/<branch-name>/)
 # This keeps naming consistent across branch, specs, and prompts directories
-$promptsDir = Join-Path $repoRoot 'history' 'prompts' $branchName
+# Note: multi-segment Join-Path requires PowerShell 7+; nest calls for Windows PowerShell 5.1 compat
+$promptsDir = Join-Path (Join-Path (Join-Path $repoRoot 'history') 'prompts') $branchName
 New-Item -ItemType Directory -Path $promptsDir -Force | Out-Null
 
 # Set the SPECIFY_FEATURE environment variable for the current session

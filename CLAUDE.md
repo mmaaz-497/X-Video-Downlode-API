@@ -1,4 +1,4 @@
-# Claude Code Rules
+﻿# Claude Code Rules
 
 This file is generated during init for the selected agent.
 
@@ -208,3 +208,56 @@ Wait for consent; never auto-create ADRs. Group related decisions (stacks, authe
 
 ## Code Standards
 See `.specify/memory/constitution.md` for code quality, testing, performance, security, and architecture principles.
+
+<!-- MANUAL ADDITIONS START -->
+
+## Active Technologies
+
+Added by `/sp.plan` for `002-http-download-api` (2026-08-13).
+
+- **HTTP layer**: FastAPI 0.115 + uvicorn 0.31. `pydantic` 2.11 arrives with FastAPI and is permitted
+  **only** in `backend/api.py`, for request and response models. Never in the service layer.
+- **Storage**: still filesystem only. One JSON file per job under `<output_dir>/.xvd-state/jobs/`,
+  written temp-then-`os.replace`. No database, queue, cache, or scheduler.
+- **Concurrency**: a service-owned `concurrent.futures.ThreadPoolExecutor`. Its `max_workers` **is**
+  the concurrency cap — there is no semaphore, deliberately. `backend/jobs.py` imports no asyncio and
+  no FastAPI, which is what keeps it testable without an event loop.
+
+**Three invariants** established in `specs/002-http-download-api/research.md`:
+
+- `downloader.py`, `validation.py`, and `config.py` are **frozen**. Do not modify them.
+- The `Job` record has **no field capable of holding raw text**. `DownloadOutcome.message` contains
+  absolute filesystem paths (`downloader.py:332`, `:309`) and must never enter the record — leakage
+  is prevented by the absence of a field, not by remembering to sanitise (research D6).
+- A caller-supplied handle **never becomes a path component**. Lookup is an in-memory dict hit, so a
+  request cannot reach the filesystem by handle at all (research D3).
+
+**Known limitation, verified against yt-dlp 2026.07.04**: the `ffmpeg` merge is invoked with no
+timeout (`postprocessor/ffmpeg.py:356`) and fires no hook we can reach, so a hung merge wedges a
+worker thread until restart. Metadata resolution, by contrast, *is* bounded (`DEFAULT_TIMEOUT = 20`,
+`networking/common.py:34`). Do not "fix" the wrong one.
+
+Added by `/sp.plan` for `001-post-video-download` (2026-08-12).
+
+- **Language**: Python 3.11+ (3.13.5 locally). Dependencies managed with `uv`.
+- **Runtime dependency**: `yt-dlp`, used as a library via the `YoutubeDL` class — **never** as a
+  subprocess. Verified against 2026.7.4.
+- **System binary**: `ffmpeg` only, located with `shutil.which`, never a hardcoded path.
+- **CLI**: `argparse` from the standard library. Do not add `click`, `typer`, or `rich`.
+- **Testing**: `pytest`, two files, zero network calls.
+- **Storage**: filesystem only. No database, queue, ORM, or auth library.
+- **Not in this feature**: any HTTP layer, FastAPI, or pydantic.
+
+**Portability**: development on Windows/PowerShell 5.1, deployment on a Linux VPS. All path handling
+goes through `pathlib` — never string concatenation or hardcoded separators.
+
+**Two non-obvious invariants** established in `specs/001-post-video-download/research.md`:
+
+- Every `YoutubeDL` construction MUST pass `allowed_extractors: ["twitter"]`. Without it, a post
+  containing a link makes the extractor hand an author-chosen third-party URL back to yt-dlp, after
+  our allowlist gate has already passed (research D8).
+- The download temp directory MUST be created inside the output directory, so promotion via
+  `os.replace` is atomic. `shutil.move` is not atomic across filesystems and can leave a partial
+  file at the destination (research D2).
+
+<!-- MANUAL ADDITIONS END -->

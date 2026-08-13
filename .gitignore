@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Test tooling
+.pytest_cache/
+
+# Secrets. .env.example is committed; .env is not (Constitution, Configuration).
+.env
+
+# Downloaded videos and service state. The output directory defaults to the
+# repository root when XVD_OUTPUT_DIR is unset, so a manual verification run
+# drops .mp4 files and a .xvd-state directory right here.
+*.mp4
+*.webm
+*.mkv
+.xvd-state/
+.tmp-xvd-*/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp

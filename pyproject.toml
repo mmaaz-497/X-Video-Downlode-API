@@ -1,0 +1,31 @@
+[project]
+name = "x-video-downloader"
+version = "0.1.0"
+description = "Download a video from a single X (Twitter) post URL"
+requires-python = ">=3.11"
+dependencies = [
+    "yt-dlp",
+    # HTTP layer (feature 002). Plain uvicorn, NOT uvicorn[standard]: the extra
+    # pulls httptools, uvloop, watchfiles, and websockets, none of which this
+    # service uses. Constitution Principle IV requires each dependency to be
+    # justified against the standard library first.
+    # pydantic is not listed: it arrives with fastapi and is confined to
+    # backend/api.py (research D11).
+    "fastapi>=0.115",
+    "uvicorn>=0.31",
+]
+
+[project.scripts]
+xvd = "backend.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
