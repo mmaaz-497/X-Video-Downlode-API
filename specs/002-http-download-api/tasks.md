@@ -207,7 +207,7 @@ does not exist yet, which is the point.
 **Independent Test**: the failure-code catalog and its coverage test run under `pytest`; the audit log
 is inspectable as a file.
 
-- [ ] **T012** [US3] Add `FAILURE_MESSAGES: dict[str, str]` to `backend/jobs.py` — the caller-safe
+- [X] **T012** [US3] Add `FAILURE_MESSAGES: dict[str, str]` to `backend/jobs.py` — the caller-safe
   sentence catalog from [data-model.md](./data-model.md).
   - Every sentence is a **literal in the source**. None interpolates a path, filename, URL, count, or
     any text originating outside this table.
@@ -216,7 +216,7 @@ is inspectable as a file.
   - At the single site where `download_post` returns, log the raw `outcome.message` together with the
     job handle so FR-033 correlation works, then discard it.
 
-- [ ] **T013** [US3] Add `FAILURE_PREFIXES` classification to `backend/jobs.py`.
+- [X] **T013** [US3] Add `FAILURE_PREFIXES` classification to `backend/jobs.py`.
   - Match `DownloadOutcome.message` with **`str.startswith`** against the explanation strings in
     `downloader._ERROR_DIAGNOSES`. This is exact, not heuristic: `_partial_failure` composes
     `f"{reason} Files already saved: {names}"` (`backend/downloader.py:559`), so the diagnosis is
@@ -230,7 +230,7 @@ is inspectable as a file.
     > cannot assert full coverage against a partial map, and the owner required T014 in this phase.
     > What US2 still owns is per-code message refinement, not the mechanism.
 
-- [ ] **T014** [US3] **Write the classification drift test in `tests/test_jobs.py`.**
+- [X] **T014** [US3] **Write the classification drift test in `tests/test_jobs.py`.**
   *(Its own task by explicit instruction — it is the single guard against silent classification decay,
   so it is a named deliverable rather than a bullet inside T011.)*
   - Import the private `downloader._ERROR_DIAGNOSES` **in the test only**, and assert every
@@ -243,7 +243,7 @@ is inspectable as a file.
     A drift guarantee that passes vacuously is worth nothing — which is precisely how feature 001's
     T006 grep survived never having run.
 
-- [ ] **T015** [US3] Add the submission audit log to `backend/jobs.py`.
+- [X] **T015** [US3] Add the submission audit log to `backend/jobs.py`.
   - Append one JSON object per line to `<state_dir>/submissions.log`: `at`, `canonical_url`,
     `client_address`, `outcome`, `handle` (FR-031).
   - **Canonical URL only, never the raw submitted string** (FR-032). It is written only after

@@ -15,6 +15,7 @@ it is transport logic: a job record, a queue position, and a failure code mean
 the same thing whether they arrived over HTTP or not.
 """
 
+import datetime
 import json
 import logging
 import os
@@ -320,6 +321,52 @@ def get(handle: str) -> Job | None:
 
 
 # --------------------------------------------------------------------------
+# The operator's audit trail (FR-031, FR-032)
+# --------------------------------------------------------------------------
+
+ACCEPTED = "accepted"
+DEDUPLICATED = "deduplicated"
+REJECTED_URL = "rejected_url"
+
+# A separate lock so an audit append never waits behind a registry scan, and so
+# two concurrent submissions cannot interleave halves of a line.
+_audit_lock = threading.Lock()
+
+
+def _audit(outcome: str, *, client_address: str, canonical_url: str | None, handle: str | None) -> None:
+    """Append one line to the operator's submission log.
+
+    Written for refusals as well as acceptances -- a refusal is the more
+    interesting entry when investigating abuse, and a run of them from one
+    address is the pattern worth seeing.
+
+    canonical_url is None for a rejected URL, and that is not an oversight.
+    FR-032 forbids storing caller free text, and a string that failed validation
+    is exactly that: unvalidated, attacker-chosen, and destined for a file the
+    operator will open in a terminal. The address and the timestamp are what
+    identify the abuse; the rejected text is not needed to do it.
+
+    Failure to write is logged and swallowed. An audit append must not be able
+    to fail a submission.
+    """
+    _require_init()
+    assert _state_dir is not None  # narrowed by _require_init
+    record = {
+        "at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "outcome": outcome,
+        "client_address": client_address,
+        "canonical_url": canonical_url,
+        "handle": handle,
+    }
+    try:
+        with _audit_lock:
+            with open(_state_dir / "submissions.log", "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
+    except OSError:
+        _log.exception("could not append to the submission log")
+
+
+# --------------------------------------------------------------------------
 # Submission
 # --------------------------------------------------------------------------
 
@@ -347,7 +394,11 @@ def submit(
     # second validation path and no bypass. download_post validates again
     # internally, which is the gate no caller can skip -- this call does not
     # replace it.
-    reference = parse_post_url(url)
+    try:
+        reference = parse_post_url(url)
+    except ValueError:
+        _audit(REJECTED_URL, client_address=client_address, canonical_url=None, handle=None)
+        raise
 
     with _lock:
         # Deduplicate on the canonical URL rather than the post id, because
@@ -360,16 +411,37 @@ def submit(
                 WAITING,
                 RUNNING,
             ):
-                return existing
+                duplicate_of = existing
+                break
+        else:
+            duplicate_of = None
 
-        job = Job(
-            handle=_mint_handle(),
-            canonical_url=reference.canonical_url,
+        if duplicate_of is None:
+            job = Job(
+                handle=_mint_handle(),
+                canonical_url=reference.canonical_url,
+                client_address=client_address,
+            )
+            _registry[job.handle] = job
+
+    if duplicate_of is not None:
+        # The caller gets a usable handle for work already underway (FR-016).
+        # They cannot tell this from a fresh acceptance, and do not need to.
+        _audit(
+            DEDUPLICATED,
             client_address=client_address,
+            canonical_url=duplicate_of.canonical_url,
+            handle=duplicate_of.handle,
         )
-        _registry[job.handle] = job
+        return duplicate_of
 
     persist(job)
+    _audit(
+        ACCEPTED,
+        client_address=client_address,
+        canonical_url=job.canonical_url,
+        handle=job.handle,
+    )
 
     assert _executor is not None  # narrowed by _require_init
     _executor.submit(_run_job, job, download)
@@ -468,17 +540,89 @@ def _finish(
 # The deliberate, visible fallback of FR-011. Declared here because _run_job
 # needs it before the classification table exists; the rest of the codes and the
 # prefix map arrive with _classify below.
+NO_VIDEO = "no_video"
+NOT_A_VIDEO = "not_a_video"
+PROTECTED_ACCOUNT = "protected_account"
+AGE_RESTRICTED = "age_restricted"
+POST_UNAVAILABLE = "post_unavailable"
+INTERRUPTED = "interrupted"
+SERVICE_UNAVAILABLE = "service_unavailable"
+TIME_LIMIT = "time_limit"
 UNCLASSIFIED = "unclassified"
+
+# Every sentence a caller can ever be shown about a failure. Each one is a
+# literal here; none interpolates a path, a filename, a URL, a count, or any
+# text originating outside this table. That is the whole of FR-029's positive
+# half -- the negative half is that the Job record has no field able to carry
+# the downloader's own message (see the Job docstring, ADR-0003).
+#
+# service_unavailable deliberately does not tell the caller that ffmpeg is
+# missing. That is an operator fault, and naming it would describe the server's
+# installation to the public.
+FAILURE_MESSAGES: dict[str, str] = {
+    NO_VIDEO: "This post does not contain a video.",
+    NOT_A_VIDEO: "This post contains media, but it is not a video.",
+    PROTECTED_ACCOUNT: (
+        "This post is from a protected account and is not publicly accessible."
+    ),
+    AGE_RESTRICTED: "This post is age-restricted and is not publicly accessible.",
+    POST_UNAVAILABLE: "This post could not be found. It may have been deleted.",
+    INTERRUPTED: (
+        "The download was interrupted and did not complete. Submit it again to retry."
+    ),
+    SERVICE_UNAVAILABLE: (
+        "The service cannot process downloads right now. "
+        "The operator has been notified."
+    ),
+    TIME_LIMIT: "The download took too long and was stopped.",
+    UNCLASSIFIED: "The download failed for an unexpected reason.",
+}
+
+# Ordered prefix -> code. Matched with str.startswith, which is exact rather
+# than heuristic here: _partial_failure composes the message as
+# f"{reason} Files already saved: {names}" (downloader.py:559), and the plain
+# path returns the reason alone, so the diagnosis is ALWAYS a prefix.
+#
+# These strings are our own literals, deliberately. downloader._ERROR_DIAGNOSES
+# is private and importing it into production code would couple the two modules
+# by their internals; the test suite imports it instead and asserts this table
+# still covers every row, so an upstream edit fails the build rather than
+# decaying quietly to unclassified (research D5, FR-011).
+#
+# A tuple rather than a dict because order is part of the meaning -- specific
+# before generic -- mirroring how the frozen module writes the same idea.
+FAILURE_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("this post has no video in it.", NO_VIDEO),
+    ("this post contains media, but it is not a video.", NOT_A_VIDEO),
+    ("this post belongs to a protected account", PROTECTED_ACCOUNT),
+    ("this post is age-restricted", AGE_RESTRICTED),
+    ("this post could not be found.", POST_UNAVAILABLE),
+    ("ffmpeg was not found on PATH.", SERVICE_UNAVAILABLE),
+    ("Interrupted by the operator.", INTERRUPTED),
+    # The frozen module's own fallback (downloader.py:132). It quotes yt-dlp
+    # verbatim, so it is the one row that is doubly bound by FR-029 -- matched
+    # only to be classified, never to be shown.
+    ("could not extract video from this post.", UNCLASSIFIED),
+)
+
+# Codes this module assigns from its own knowledge rather than by reading a
+# message. The drift test uses this to tell "not in the prefix table" apart from
+# "missing from the prefix table".
+SELF_ASSIGNED_CODES = frozenset({TIME_LIMIT})
 
 
 def _classify(message: str) -> str:
     """Map a DownloadOutcome.message to a failure code.
 
-    T009 placeholder: every failure classifies as unclassified until T013 adds
-    the prefix table. Left deliberately incomplete rather than reordering the
-    tasks, so the drift test that pins the table lands as its own named
-    deliverable.
+    Returns UNCLASSIFIED for anything unrecognised, which is a deliberate and
+    visible outcome rather than a silent substitution (FR-011). The messages
+    that legitimately land here include f"download failed for video {n}: ..."
+    (downloader.py:534), which can embed a temp-directory path -- another reason
+    the text is classified and dropped rather than forwarded.
     """
+    for prefix, code in FAILURE_PREFIXES:
+        if message.startswith(prefix):
+            return code
     return UNCLASSIFIED
 
 

@@ -159,8 +159,12 @@ def test_finished_job_does_not_absorb_a_new_submission(service, tmp_path):
         "   ",
     ],
 )
-def test_rejected_url_raises_and_creates_nothing(service, url):
-    """FR-003: no job, no record, nothing reserved."""
+def test_rejected_url_raises_and_creates_no_job(service, url):
+    """FR-003: no job, no record, nothing reserved.
+
+    An audit line IS written -- that is FR-031, and a run of rejections from one
+    address is the pattern worth seeing. Nothing in the *jobs* directory.
+    """
     with pytest.raises(ValueError):
         service.submit(url, "203.0.113.7", download=_stub())
     assert service._registry == {}
@@ -324,6 +328,163 @@ def test_get_returns_none_for_unknown_handles(service):
     assert service.get("a" * 43) is None
     assert service.get("") is None
     assert service.get("../../etc/passwd") is None
+
+
+# --------------------------------------------------------------------------
+# The operator's audit trail (FR-031, FR-032)
+# --------------------------------------------------------------------------
+
+
+def _audit_lines(service):
+    path = service._state_dir / "submissions.log"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def test_acceptance_is_audited(service):
+    job = service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    (line,) = _audit_lines(service)
+    assert line["outcome"] == "accepted"
+    assert line["client_address"] == "203.0.113.7"
+    assert line["canonical_url"] == job.canonical_url
+    assert line["handle"] == job.handle
+    assert line["at"]
+
+
+def test_deduplication_is_audited_separately(service):
+    service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    service.submit(BARE_URL, "198.51.100.4", download=_stub())
+    outcomes = [line["outcome"] for line in _audit_lines(service)]
+    assert outcomes == ["accepted", "deduplicated"]
+    assert _audit_lines(service)[1]["client_address"] == "198.51.100.4"
+
+
+def test_rejection_is_audited_without_the_submitted_text(service):
+    """FR-032: a string that failed validation is unvalidated caller free text.
+
+    The operator gets the address and the time, which is what identifies abuse.
+    They do not get an attacker-chosen string written into a file they will open
+    in a terminal.
+    """
+    hostile = "https://evil.com/\x1b]0;pwned\x07/status/20"
+    with pytest.raises(ValueError):
+        service.submit(hostile, "203.0.113.7", download=_stub())
+
+    (line,) = _audit_lines(service)
+    assert line["outcome"] == "rejected_url"
+    assert line["client_address"] == "203.0.113.7"
+    assert line["canonical_url"] is None
+    assert line["handle"] is None
+    assert "evil.com" not in json.dumps(line)
+    assert "pwned" not in json.dumps(line)
+
+
+# --------------------------------------------------------------------------
+# Classification drift (FR-010, FR-011, research D5)
+#
+# This section is the single guard against silent decay in the failure codes.
+# The diagnosis exists only as prose in a PRIVATE table inside a module we are
+# forbidden to modify, so our map duplicates knowledge we do not own. That
+# coupling cannot be removed -- the clean fix is a `code` field on
+# DownloadOutcome, and downloader.py is frozen -- so the whole mitigation is
+# that an upstream edit must break the build instead of quietly turning every
+# diagnosis into "unclassified".
+#
+# Importing a private name is acceptable HERE and nowhere else: this is the one
+# place whose job is to notice when that private thing changes.
+# --------------------------------------------------------------------------
+
+
+def test_every_upstream_diagnosis_is_classified():
+    """Every explanation in _ERROR_DIAGNOSES maps to exactly one code.
+
+    If this fails, yt-dlp's error text or the frozen module's wording changed.
+    Do NOT relax the assertion -- update FAILURE_PREFIXES to match, which is the
+    whole point of being told.
+    """
+    from backend.downloader import _ERROR_DIAGNOSES
+
+    for _needle, explanation in _ERROR_DIAGNOSES:
+        matches = [code for prefix, code in jobs.FAILURE_PREFIXES if explanation.startswith(prefix)]
+        assert matches, (
+            f"no failure code covers the upstream diagnosis {explanation!r}. "
+            "backend/downloader.py changed; update FAILURE_PREFIXES."
+        )
+        assert len(matches) == 1, (
+            f"the diagnosis {explanation!r} matches {len(matches)} prefixes {matches}. "
+            "Prefixes must be unambiguous."
+        )
+
+
+def test_upstream_diagnoses_do_not_all_collapse_to_one_code():
+    """Coverage alone is not enough: FR-010 requires the codes to be distinct.
+
+    A single catch-all prefix would satisfy the test above while destroying the
+    thing the requirement exists for.
+    """
+    from backend.downloader import _ERROR_DIAGNOSES
+
+    codes = {jobs._classify(explanation) for _needle, explanation in _ERROR_DIAGNOSES}
+    assert len(codes) >= 4
+    assert jobs.UNCLASSIFIED not in codes
+
+
+def test_every_code_has_a_caller_safe_message():
+    from_prefixes = {code for _prefix, code in jobs.FAILURE_PREFIXES}
+    assert from_prefixes | jobs.SELF_ASSIGNED_CODES == set(jobs.FAILURE_MESSAGES)
+
+
+def test_no_caller_message_can_leak_a_path():
+    """FR-029 at the level of the catalog itself."""
+    for code, message in jobs.FAILURE_MESSAGES.items():
+        assert "/" not in message, code
+        assert "\\" not in message, code
+        assert ".." not in message, code
+        assert "yt-dlp" not in message.lower(), code
+        assert "ffmpeg" not in message.lower(), code
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("this post has no video in it.", "no_video"),
+        ("this post contains media, but it is not a video.", "not_a_video"),
+        (
+            "this post belongs to a protected account and is not publicly accessible. "
+            "This tool does not authenticate.",
+            "protected_account",
+        ),
+        (
+            "this post is age-restricted and is not publicly accessible. "
+            "This tool does not authenticate.",
+            "age_restricted",
+        ),
+        ("this post could not be found. It may have been deleted.", "post_unavailable"),
+        (
+            "ffmpeg was not found on PATH. It is required to combine video and audio "
+            "into one file. Install it and try again.",
+            "service_unavailable",
+        ),
+        ("Interrupted by the operator. Video 1 was not completed.", "interrupted"),
+        ("could not extract video from this post. yt-dlp said: HTTP 429", "unclassified"),
+        ("download failed for video 2: expected exactly one finished file in C:\\x", "unclassified"),
+        ("something nobody has ever seen", "unclassified"),
+    ],
+)
+def test_classification_of_each_known_message(message, expected):
+    assert jobs._classify(message) == expected
+
+
+def test_classification_survives_the_partial_failure_suffix():
+    """_partial_failure appends to the reason (downloader.py:559).
+
+    This is why startswith is exact rather than a guess -- and why the suffix
+    must not change the code.
+    """
+    reason = "this post has no video in it."
+    composed = f"{reason} Files already saved: someone-20-1.mp4"
+    assert jobs._classify(composed) == jobs._classify(reason) == "no_video"
 
 
 def test_get_never_touches_the_filesystem(service, monkeypatch):
