@@ -19,6 +19,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -300,11 +301,33 @@ def persist(job: Job) -> None:
 # (spec Q1) -- so the margin is the security argument, not decoration.
 _HANDLE_BYTES = 32
 
+# base64url of 32 bytes is 43 characters once the padding is stripped. Derived
+# here rather than written as a literal so the pattern cannot drift away from
+# the minter if _HANDLE_BYTES ever changes.
+HANDLE_LENGTH = len(secrets.token_urlsafe(_HANDLE_BYTES))
+HANDLE_PATTERN = re.compile(rf"\A[A-Za-z0-9_-]{{{HANDLE_LENGTH}}}\Z")
+
 _registry: dict[str, Job] = {}
 
 
 def _mint_handle() -> str:
     return secrets.token_urlsafe(_HANDLE_BYTES)
+
+
+def is_valid_handle(candidate: str) -> bool:
+    """Whether a string is shaped like a handle this service could have minted.
+
+    Lives here rather than in the transport because this module mints handles
+    and therefore owns their shape; a pattern written down anywhere else would
+    be free to drift away from the minter.
+
+    A cheap second layer only. The first and real one is that get() is a dict
+    lookup, so a caller-supplied string never becomes a path component whatever
+    it contains (research D3). A false answer here must produce exactly the same
+    refusal as an unknown handle, or the shape of the input would tell a caller
+    something the lookup does not.
+    """
+    return bool(HANDLE_PATTERN.match(candidate))
 
 
 def get(handle: str) -> Job | None:

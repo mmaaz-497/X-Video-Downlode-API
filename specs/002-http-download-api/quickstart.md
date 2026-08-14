@@ -103,19 +103,41 @@ ls -a "$XVD_OUTPUT_DIR" | grep tmp-xvd   # → nothing (FR-026)
 
 ## Deployment note that is *not* optional
 
-Behind a reverse proxy, `request.client.host` is the **proxy's** address. Every caller would then
-share one rate-limit bucket and the audit log would record the proxy for every submission — FR-019
-and FR-031 both silently break. Start uvicorn with:
+The application reads `request.client` and **never** a header — deciding whether a proxy header may
+be believed is uvicorn's job, because only the operator knows what sits in front of the service.
 
-```bash
-uv run uvicorn backend.api:app --proxy-headers --forwarded-allow-ips=127.0.0.1
+**Verified against uvicorn 0.52.2** (`uvicorn/config.py:355-357`), and it is not what the planning
+documents originally assumed:
+
+```text
+proxy_headers       = True          # ON by default
+forwarded_allow_ips = "127.0.0.1"   # or $FORWARDED_ALLOW_IPS
 ```
 
-`--forwarded-allow-ips` must name the proxy specifically. Trusting `X-Forwarded-For` from anyone lets
-any caller spoof their address and defeat the rate limit entirely (research D9).
+`X-Forwarded-For` is therefore honoured out of the box, but only from `127.0.0.1`. Three cases, and
+only one needs a flag:
 
-Proxy, TLS, and service-manager configuration are out of scope for this feature; this flag is not,
-because it is an application argument.
+| Deployment | Command | Why |
+|---|---|---|
+| Reverse proxy on the **same host** | *(nothing)* | The proxy connects from `127.0.0.1` and is already trusted. |
+| Reverse proxy on a **different host** | `--forwarded-allow-ips=<proxy IP>` | Otherwise the proxy is untrusted, every caller collapses into its single address, and the audit log stops identifying anyone. |
+| **No proxy**, exposed directly | `--no-proxy-headers` | Otherwise anything reaching the port from `127.0.0.1` — another local process, a container sharing the namespace, someone's SSH tunnel — can set its own address, forge the audit trail, and escape a per-address rate limit. |
+
+Never `--forwarded-allow-ips='*'`. That believes the header from anyone who can reach the port, which
+is the same as not checking it.
+
+Confirm it before trusting the log:
+
+```bash
+curl -s -X POST localhost:8000/jobs -H 'content-type: application/json' \
+  -H 'X-Forwarded-For: 6.6.6.6' -d '{"url":"https://not-x.example/nope"}'
+tail -1 "$XVD_STATE_DIR/submissions.log"
+# client_address must be the real caller. If it says 6.6.6.6, the header was
+# believed and your configuration is wrong for this deployment.
+```
+
+Proxy, TLS, and service-manager configuration are out of scope for this feature; these flags are not,
+because they are application arguments.
 
 ## Known limitation to watch for
 

@@ -308,7 +308,7 @@ progress advance, retrieve a playable file with picture and sound.
 **Independent Test**: [quickstart.md](./quickstart.md) § "Multi-caller safety" — three handle shapes
 give one identical response, and the leakage grep is silent.
 
-- [ ] **T020** [US3] Make every unresolvable handle produce one identical refusal in
+- [X] **T020** [US3] Make every unresolvable handle produce one identical refusal in
   `backend/api.py`.
   - Unknown, malformed, and wrong-length handles all return
     `404 {"code":"not_found","message":"No such job."}` — same status, same body (FR-028).
@@ -318,18 +318,18 @@ give one identical response, and the leakage grep is silent.
   - No secret-dependent branch: both paths return the same response object. Constant-time comparison
     is **not** used and **not** claimed; the 256-bit space is the defence (research D8).
 
-- [ ] **T021** [US3] Replace the leaking default handlers in `backend/api.py`.
+- [X] **T021** [US3] Replace the leaking default handlers in `backend/api.py`.
   - Override the `RequestValidationError` handler: pydantic returns the offending input under
     `"input"` by default, which FR-005 forbids. Return a fixed body.
   - Add a catch-all `Exception` handler that logs the traceback and returns one fixed 500 body.
   - Neither handler may include a path, a directory name, an exception type, or a library name.
 
-- [ ] **T022** [US3] Pass the caller's address into the service layer in `backend/api.py`.
+- [X] **T022** [US3] Pass the caller's address into the service layer in `backend/api.py`.
   - `request.client.host` → `jobs.submit(url, client_address=...)`, feeding T015's audit record.
   - **The application MUST NOT read `X-Forwarded-For` itself.** Trusting it from an untrusted source
     would let any caller spoof their address and defeat the rate limit that Phase 3 will add.
 
-- [ ] **T023** [US3] Document the proxy-header requirement as an operational contract.
+- [X] **T023** [US3] Document the proxy-header requirement as an operational contract.
   - Record in `.env.example` and [quickstart.md](./quickstart.md) that behind a reverse proxy the
     service **must** be started as
     `uvicorn backend.api:app --proxy-headers --forwarded-allow-ips=<proxy-ip>`.
@@ -347,13 +347,13 @@ the leakage grep is silent across every endpoint.
 
 ## Phase 7: Verification & Boundary Checks
 
-- [ ] **T024** Confirm the frozen modules are untouched.
+- [X] **T024** Confirm the frozen modules are untouched.
   - **Verify**: `git diff --stat HEAD -- backend/downloader.py backend/validation.py backend/config.py`
     prints nothing.
   - A non-empty result means a task above needed something the boundary does not offer. **Stop and
     report it** rather than editing the file — that is the standing instruction for this feature.
 
-- [ ] **T025** Verify the Principle III boundary with an **AST-based** check, in
+- [X] **T025** Verify the Principle III boundary with an **AST-based** check, in
   `tests/test_jobs.py`.
   - Parse `backend/jobs.py` with `ast.parse` and walk `ast.Import` / `ast.ImportFrom` nodes. Assert
     no imported module name is or starts with `fastapi`, `starlette`, `pydantic`, or `asyncio`.
@@ -368,7 +368,7 @@ the leakage grep is silent across every endpoint.
   - Being a test, it runs on every `pytest` invocation instead of relying on someone remembering to
     run a grep.
 
-- [ ] **T026** Verify SC-005: no response leaks anything.
+- [X] **T026** Verify SC-005: no response leaks anything.
   - Drive every endpoint and every error branch — valid, invalid URL, unknown handle, malformed
     handle, not-ready, multi-file-no-index, and a deliberately forced internal error — and grep every
     response body for `/home`, `/var`, `/tmp`, `C:\`, `Traceback`, `yt_dlp`, `.tmp-xvd`, and the
@@ -386,7 +386,7 @@ the leakage grep is silent across every endpoint.
   - An unknown handle and a well-formed but unissued handle produce **byte-identical** refusals.
   - Record the results inline in this file, as feature 001 did.
 
-- [ ] **T028** [P] Update `.env.example` with the Phase-1 variables only — `XVD_OUTPUT_DIR`,
+- [X] **T028** [P] Update `.env.example` with the Phase-1 variables only — `XVD_OUTPUT_DIR`,
   `XVD_STATE_DIR`, `XVD_MAX_CONCURRENT` — each with its default and one line on what it governs.
   Later phases add their own; listing them now would advertise configuration that does nothing.
 

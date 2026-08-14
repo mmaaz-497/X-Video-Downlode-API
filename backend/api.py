@@ -19,13 +19,18 @@ Pydantic appears in this file and nowhere else in the package (research D11).
 """
 
 import datetime
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import jobs
+
+_log = logging.getLogger("xvd.api")
 
 
 @asynccontextmanager
@@ -126,6 +131,25 @@ def _not_found() -> JSONResponse:
     return _error(404, "not_found", "No such job.")
 
 
+def _lookup(handle: str) -> jobs.Job | None:
+    """Resolve a handle, treating a malformed one exactly like an unknown one.
+
+    The shape check is NOT expressed as a route pattern on purpose. A FastAPI
+    `Path(pattern=...)` produces a 422 on mismatch, and a 422 would tell a caller
+    that their input was the wrong shape -- which is one bit more than they get
+    for a well-formed handle that simply does not exist. Both answers must be
+    the same answer (FR-028).
+
+    No constant-time comparison is used here and none is claimed. The defence is
+    the 256-bit space: an attacker cannot collect enough valid-handle samples
+    for a timing signal to mean anything, and asserting a property Python's dict
+    internals would not guarantee would be worse than saying so plainly.
+    """
+    if not jobs.is_valid_handle(handle):
+        return None
+    return jobs.get(handle)
+
+
 def _as_response(job: jobs.Job) -> JobResponse:
     progress = None
     if job.state == jobs.RUNNING:
@@ -160,6 +184,65 @@ def _as_response(job: jobs.Job) -> JobResponse:
 
 
 # --------------------------------------------------------------------------
+# The handlers that replace the leaking defaults
+#
+# Both frameworks ship defaults that are helpful in development and wrong on a
+# public service. Neither is left in place.
+# --------------------------------------------------------------------------
+
+# Fixed bodies for the statuses the framework itself can raise. A 404 from the
+# router is given the same body as a 404 from a handler, so a path that matches
+# no route is indistinguishable from a handle that resolves to nothing.
+_STATUS_BODIES: dict[int, tuple[str, str]] = {
+    404: ("not_found", "No such job."),
+    405: ("method_not_allowed", "That method is not allowed here."),
+    413: ("too_large", "That request was too large."),
+}
+_GENERIC_BODY = ("request_failed", "The service could not complete that request.")
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Replace pydantic's default 422, which echoes the caller's input.
+
+    The default body includes an "input" field carrying the offending value
+    verbatim -- so a request with {"output_dir": "/etc/shadow"} gets that string
+    reflected straight back. FR-005 forbids echoing submitted content, so the
+    detail goes to the log and the caller gets one fixed sentence.
+    """
+    _log.info("rejected malformed request: %s", exc.errors())
+    return _error(422, "invalid_request", "The request body was not understood.")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_handler(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Give framework-raised errors the same body shape as our own.
+
+    Without this, a request to a path matching no route returns Starlette's
+    {"detail": "Not Found"} while an unknown handle returns ours -- two
+    different refusals for two kinds of nothing, which is exactly the
+    distinction FR-028 exists to remove.
+
+    exc.detail is deliberately not forwarded: it is framework text, and the
+    rule is that no caller-visible string originates outside this file.
+    """
+    code, message = _STATUS_BODIES.get(exc.status_code, _GENERIC_BODY)
+    return _error(exc.status_code, code, message)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """The last line of FR-029.
+
+    Anything that reaches here is a bug, and a bug's traceback names files,
+    directories, and library internals. The operator gets all of it in the log;
+    the caller gets one sentence and no clue about what runs on the server.
+    """
+    _log.exception("unhandled error serving a request", exc_info=exc)
+    return _error(500, "internal_error", "The service could not complete that request.")
+
+
+# --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
 
@@ -170,7 +253,7 @@ def _as_response(job: jobs.Job) -> JobResponse:
     response_model=JobResponse,
     responses={400: {"model": Error}},
 )
-def submit_job(body: SubmitRequest) -> JobResponse | JSONResponse:
+def submit_job(body: SubmitRequest, request: Request) -> JobResponse | JSONResponse:
     """Accept a URL and answer immediately with a handle (FR-001).
 
     The response for a deduplicated submission is identical to a fresh one. The
@@ -180,7 +263,7 @@ def submit_job(body: SubmitRequest) -> JobResponse | JSONResponse:
     try:
         # No `download` argument. That parameter is a test seam and this layer
         # must never be the thing that supplies it.
-        job = jobs.submit(body.url, _caller())
+        job = jobs.submit(body.url, _caller(request))
     except ValueError:
         # parse_post_url's ValueError names the URL and the accepted hosts. It
         # is useful to an operator and is written to the log by the service
@@ -192,7 +275,7 @@ def submit_job(body: SubmitRequest) -> JobResponse | JSONResponse:
 
 @app.get("/jobs/{handle}", response_model=JobResponse, responses={404: {"model": Error}})
 def get_job(handle: str) -> JobResponse | JSONResponse:
-    job = jobs.get(handle)
+    job = _lookup(handle)
     if job is None:
         return _not_found()
     return _as_response(job)
@@ -233,7 +316,7 @@ def get_job_file_by_index(handle: str, index: int) -> FileResponse | JSONRespons
 
 
 def _serve(handle: str, index: int | None) -> FileResponse | JSONResponse:
-    job = jobs.get(handle)
+    job = _lookup(handle)
     if job is None:
         return _not_found()
 
@@ -263,12 +346,25 @@ def _serve(handle: str, index: int | None) -> FileResponse | JSONResponse:
     return FileResponse(result.path, filename=result.path.name)
 
 
-def _caller() -> str:
-    """The calling address, for the audit record and the future rate limit.
+def _caller(request: Request) -> str:
+    """The calling address, for the audit record (FR-031) and the later rate limit.
 
-    A placeholder until T022 threads the request through. It deliberately does
-    NOT read X-Forwarded-For: trusting that header from an untrusted source
-    would let any caller choose their own identity and defeat the rate limit
-    outright.
+    Reads request.client and NOTHING else. In particular it does not look at
+    X-Forwarded-For, X-Real-IP, or any other header a caller can set. Trusting
+    one of those from an untrusted source would let every caller choose their
+    own identity, which defeats a per-address rate limit completely and fills
+    the audit log with whatever an abuser felt like typing.
+
+    Running behind a reverse proxy is handled one layer out, not here: uvicorn's
+    --proxy-headers rewrites request.client from X-Forwarded-For, but only for
+    connections from the addresses named in --forwarded-allow-ips. That keeps
+    the trust decision in the operator's start-up command, where it belongs,
+    instead of in a header this code would have no way to judge. See
+    .env.example and quickstart.md; without those flags every caller collapses
+    into the proxy's single address.
+
+    request.client is None for transports that have no peer address, so the
+    fallback keeps the audit line well-formed rather than crashing a submission
+    over a missing field.
     """
-    return "unknown"
+    return request.client.host if request.client else "unknown"

@@ -10,6 +10,7 @@ purpose is this file: a plain function that returns a literal `DownloadOutcome`,
 per Principle II's "plain fakes and stub objects only, if anything".
 """
 
+import ast
 import json
 import re
 import time
@@ -499,3 +500,115 @@ def test_get_never_touches_the_filesystem(service, monkeypatch):
 
     monkeypatch.setattr("builtins.open", forbidden)
     assert service.get("../../../etc/passwd") is None
+
+
+# --------------------------------------------------------------------------
+# The Principle III boundary (T025)
+#
+# Feature 001 checked this with `grep -nE "argparse|sys\.exit|print\("` and the
+# grep matched the module docstring, which described the constraint using the
+# forbidden words. It therefore never passed as written and was signed off by
+# eye (specs/001-post-video-download/tasks.md:147-151).
+#
+# These checks walk the syntax tree instead. An AST sees imports and calls and
+# cannot see prose, so a docstring is free to state the rule honestly. They also
+# live in the test suite rather than in a command someone has to remember, which
+# is the other half of what went wrong last time.
+# --------------------------------------------------------------------------
+
+_BACKEND = Path(__file__).resolve().parent.parent / "backend"
+
+# Importing any of these into the service layer would end its independence from
+# the transport -- and with it the ability to write this very file.
+_FRAMEWORK_ROOTS = frozenset({"fastapi", "starlette", "pydantic", "asyncio", "anyio", "uvicorn"})
+
+# Markers of work that belongs one layer down, not in a request handler.
+_LOWER_LAYER_ROOTS = frozenset({"os", "pathlib", "shutil", "tempfile", "subprocess", "yt_dlp"})
+
+
+def _parse(name: str) -> ast.Module:
+    return ast.parse((_BACKEND / name).read_text(encoding="utf-8"), filename=name)
+
+
+def _imported(tree: ast.Module) -> set[str]:
+    """Every module named by an import statement, dotted forms included."""
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            found.add(node.module)
+            found.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return found
+
+
+def _called_names(tree: ast.Module) -> set[str]:
+    """Bare function names that are called, e.g. `open` in `open(path)`."""
+    return {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+
+def test_service_layer_imports_no_framework():
+    """backend/jobs.py must stay usable without a web stack or an event loop.
+
+    This is the assertion the whole phase ordering exists to protect. If it
+    fails, the service layer can no longer be exercised by plain function calls
+    and every test above it becomes an integration test.
+    """
+    offenders = {
+        module
+        for module in _imported(_parse("jobs.py"))
+        if module.split(".")[0] in _FRAMEWORK_ROOTS
+    }
+    assert not offenders, f"backend/jobs.py imports {sorted(offenders)}"
+
+
+def test_ast_check_is_not_fooled_by_prose():
+    """The T006 lesson, tested rather than trusted.
+
+    A grep for these words would match this literal source; the AST walk finds
+    no imports in it, because a docstring is not an import statement.
+    """
+    prose_only = ast.parse(
+        '"""This module must never import fastapi, asyncio, or pydantic."""\n'
+        "import json\n"
+        "# fastapi is also mentioned here, in a comment\n"
+    )
+    assert _imported(prose_only) == {"json"}
+    assert "fastapi" in ast.get_docstring(prose_only)
+
+
+def test_transport_layer_calls_the_service_layer():
+    assert "backend.jobs" in _imported(_parse("api.py"))
+
+
+def test_transport_layer_does_not_reach_past_the_service_layer():
+    """api.py parses, calls, and serialises. Filesystem work belongs below it."""
+    offenders = {
+        module
+        for module in _imported(_parse("api.py"))
+        if module.split(".")[0] in _LOWER_LAYER_ROOTS
+    }
+    assert not offenders, f"backend/api.py imports {sorted(offenders)}"
+    assert "open" not in _called_names(_parse("api.py"))
+
+
+def test_transport_layer_has_no_loops():
+    """A loop in a handler is iteration over domain data, which is logic.
+
+    Cheap and blunt on purpose: if formatting a response ever genuinely needs a
+    loop, that is worth a second look rather than a silent allowance.
+    """
+    tree = _parse("api.py")
+    loops = [node for node in ast.walk(tree) if isinstance(node, (ast.For, ast.While))]
+    assert not loops, f"backend/api.py contains {len(loops)} loop(s)"
+
+
+def test_frozen_modules_are_not_imported_for_writing():
+    """jobs.py consumes the frozen modules; it must not reach into their privates."""
+    imported = _imported(_parse("jobs.py"))
+    private = {name for name in imported if name.rsplit(".", 1)[-1].startswith("_")}
+    assert not private, f"backend/jobs.py imports private names {sorted(private)}"

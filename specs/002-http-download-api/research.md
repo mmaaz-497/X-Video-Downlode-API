@@ -323,12 +323,20 @@ the hot submission path to defend against an attacker who would have to be able 
 service to exploit it — and anyone who can do that has already won.
 
 **Caller identity, and a deployment requirement this creates**: the address comes from
-`request.client.host`. **Behind a reverse proxy this is the proxy's address**, which would collapse
-every caller into one bucket and make the FR-031 audit record useless. Proxy configuration is out of
-scope for this feature, but the *application* must be able to honour forwarded headers, so uvicorn
-must be started with `--proxy-headers --forwarded-allow-ips=<proxy ip>`. This is documented in
-quickstart.md as an operational requirement. Trusting `X-Forwarded-For` unconditionally would let any
-caller spoof their address and defeat the rate limit entirely, so it is never trusted by default.
+`request.client.host`, and the application never reads a header itself — whether a proxy header may
+be believed is a question only the operator can answer, so it belongs in the start-up command.
+
+> **Corrected 2026-08-14 during T022.** This entry originally said uvicorn must be started with
+> `--proxy-headers` and that without it every caller collapses into the proxy's address. That is
+> wrong. Read from `uvicorn/config.py:355-357` (0.52.2): `proxy_headers` defaults to **`True`** and
+> `forwarded_allow_ips` defaults to **`"127.0.0.1"`**. `X-Forwarded-For` is therefore honoured out of
+> the box from localhost — confirmed empirically, a spoofed header was accepted with no flags passed.
+>
+> The consequences invert. A same-host reverse proxy needs **no flag**. A proxy on another host needs
+> `--forwarded-allow-ips=<its IP>`. And a service exposed **directly**, with no proxy, should pass
+> `--no-proxy-headers`, because otherwise anything that can reach the port from `127.0.0.1` can
+> choose its own identity. `'*'` remains never acceptable. quickstart.md and `.env.example` carry the
+> corrected table.
 
 ---
 
