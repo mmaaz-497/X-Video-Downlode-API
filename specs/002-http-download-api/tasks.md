@@ -262,7 +262,7 @@ still does not exist.**
 
 **Independent Test**: the `curl` sequence in [quickstart.md](./quickstart.md) § "The happy path".
 
-- [ ] **T016** [US1] Create `backend/api.py`: the app, its lifespan, and the pydantic models.
+- [X] **T016** [US1] Create `backend/api.py`: the app, its lifespan, and the pydantic models.
   - `FastAPI(debug=False)` so no traceback middleware is installed (research D6).
   - `SubmitRequest` with `model_config = ConfigDict(extra="forbid")` and `url: str` capped at 2048
     characters. **`extra="forbid"` is load-bearing, not tidiness** — it is what makes FR-004
@@ -271,7 +271,7 @@ still does not exist.**
   - Lifespan shuts the executor down on exit. **Restart recovery is Phase 5 of the plan — not here.**
   - Pydantic appears in this file and **nowhere else** (research D11).
 
-- [ ] **T017** [US1] Implement `POST /jobs` in `backend/api.py`.
+- [X] **T017** [US1] Implement `POST /jobs` in `backend/api.py`.
   - Call `jobs.submit(...)`; return **202** with the `Job` shape from
     [contracts/openapi.yaml](./contracts/openapi.yaml).
   - Catch `ValueError` from validation → **400** with a fixed message. Never echo the submitted URL
@@ -279,13 +279,13 @@ still does not exist.**
   - A deduplicated submission returns the same body as a new one — the caller cannot tell, and does
     not need to.
 
-- [ ] **T018** [US1] Implement `GET /jobs/{handle}` in `backend/api.py`.
+- [X] **T018** [US1] Implement `GET /jobs/{handle}` in `backend/api.py`.
   - Serialise from the record: `handle`, `state`, `file_count`, `progress` while running, `failure`
     when failed, timestamps.
   - `failure.message` comes from `FAILURE_MESSAGES[code]` — **the record has no other text to offer,
     which is the point** (T003, ADR-0003).
 
-- [ ] **T019** [US1] Implement `GET /jobs/{handle}/file` and `GET /jobs/{handle}/file/{index}` in
+- [X] **T019** [US1] Implement `GET /jobs/{handle}/file` and `GET /jobs/{handle}/file/{index}` in
   `backend/api.py`.
   - `FileResponse` with the path from `jobs.file_for(...)` — **only** from the record, never from
     anything in the request (FR-030).
