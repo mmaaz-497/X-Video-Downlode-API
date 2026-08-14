@@ -130,14 +130,14 @@ record. No story work has started.
 **Independent Test**: `tests/test_jobs.py` drives submission, state transitions, and file selection
 with no event loop, no HTTP client, and no network.
 
-- [ ] **T005** [US1] Add handle minting and the in-memory registry to `backend/jobs.py`.
+- [X] **T005** [US1] Add handle minting and the in-memory registry to `backend/jobs.py`.
   - `secrets.token_urlsafe(32)` — 32 **bytes**, giving 256 bits in a 43-character string (verified,
     research D8). Not 16, and not a UUID.
   - `dict[str, Job]` registry plus `get(handle) -> Job | None`.
   - **`get()` MUST NOT touch the filesystem.** A caller-supplied handle never becomes a path
     component; that is the structural path-traversal answer (research D3), not the syntactic check.
 
-- [ ] **T006** [US1] Implement `submit(url, client_address) -> Job` in `backend/jobs.py`.
+- [X] **T006** [US1] Implement `submit(url, client_address) -> Job` in `backend/jobs.py`.
   - Call the frozen `validation.parse_post_url(url)` **first**. Let its `ValueError` propagate — the
     HTTP layer maps it to 400. No job, no record, no network request (FR-003).
   - Deduplicate on `canonical_url` against jobs in `waiting` or `running`; return the existing job
@@ -146,7 +146,7 @@ with no event loop, no HTTP client, and no network.
   - Mint the handle, build the record, persist it (T004), then `executor.submit(...)`.
   - Disk guard, rate limit, and pending cap are Phase 3 of the plan — **not here**.
 
-- [ ] **T007** [US1] Add the executor and the worker function to `backend/jobs.py`.
+- [X] **T007** [US1] Add the executor and the worker function to `backend/jobs.py`.
   - Module-level `concurrent.futures.ThreadPoolExecutor(max_workers=XVD_MAX_CONCURRENT)`.
     `max_workers` **is** the concurrency cap — no semaphore (research D2, ADR-0002).
   - Worker's first statement: transition `waiting → running` and set `started_at`.
@@ -159,7 +159,7 @@ with no event loop, no HTTP client, and no network.
     that makes that possible without a mocking library.
   - Every terminal transition goes through T003's guard.
 
-- [ ] **T008** [US1] Add the progress callback in `backend/jobs.py`.
+- [X] **T008** [US1] Add the progress callback in `backend/jobs.py`.
   - Read `downloaded_bytes` and `total_bytes` (or `total_bytes_estimate`) from yt-dlp's status dict;
     update the record **in memory only** (research D3).
   - Tolerate a missing total — FR-008 makes progress advisory, and for a multi-video post the figures
@@ -167,7 +167,7 @@ with no event loop, no HTTP client, and no network.
   - **Do not add the deadline check here.** The time limit is FR-020, Phase 3 of the plan. The
     callback is where it will go; it does not go there yet.
 
-- [ ] **T009** [US1] Map `DownloadOutcome` to a terminal state in `backend/jobs.py`.
+- [X] **T009** [US1] Map `DownloadOutcome` to a terminal state in `backend/jobs.py`.
   - `downloaded` and `skipped` → `finished`, storing `outcome.paths` in `files` and setting
     `completed_at`. `skipped` is a success: feature 001 returns it when the file is already present.
   - `failed` → `failed` with a `failure_code` from T013.
@@ -175,7 +175,7 @@ with no event loop, no HTTP client, and no network.
     `build_target`) → `failed` / `unclassified`, raw text to the log only.
   - **Never store `outcome.message` on the record.**
 
-- [ ] **T010** [US1] Implement `file_for(job, index=None) -> Path` in `backend/jobs.py`.
+- [X] **T010** [US1] Implement `file_for(job, index=None) -> Path` in `backend/jobs.py`.
   - No index and exactly one file → that file. No index and several → refuse, naming the count. An
     index → bounds-check against `job.files` (FR-035, FR-036; spec Q2).
   - **An index is never required for a single-file job** — that is the common case and the explicit
@@ -184,7 +184,7 @@ with no event loop, no HTTP client, and no network.
   - Re-check the file exists before returning it; if it is gone, the caller must be told, never handed
     a partial or empty body (FR-014).
 
-- [ ] **T011** [US1] Create `tests/test_jobs.py` covering the service layer, with no network and no
+- [X] **T011** [US1] Create `tests/test_jobs.py` covering the service layer, with no network and no
   HTTP.
   - Handle format: 43 characters, `[A-Za-z0-9_-]` only, and two mints differ.
   - Deduplication: two URL spellings of one post collapse to one job; `/video/1` and the bare URL do

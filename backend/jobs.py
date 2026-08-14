@@ -18,13 +18,18 @@ the same thing whether they arrived over HTTP or not.
 import json
 import logging
 import os
+import secrets
 import tempfile
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from backend.config import output_dir as _configured_output_dir
+from backend.downloader import DownloadOutcome, download_post
+from backend.validation import parse_post_url
 
 # Every value has a working default so the service starts with no configuration
 # at all (Constitution Principle VII, FR-034). config.py is frozen, so these are
@@ -49,6 +54,7 @@ _output_dir: Path | None = None
 _state_dir: Path | None = None
 _jobs_dir: Path | None = None
 _max_concurrent: int = _DEFAULT_MAX_CONCURRENT
+_executor: ThreadPoolExecutor | None = None
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -106,6 +112,35 @@ def init() -> None:
         pass
 
     _max_concurrent = _positive_int(ENV_MAX_CONCURRENT, _DEFAULT_MAX_CONCURRENT)
+
+    # max_workers IS the concurrency cap (FR-015). There is deliberately no
+    # semaphore: the pool's queue already draws the waiting/running line, and a
+    # second mechanism guarding the same invariant is a second source of truth
+    # that can disagree with the first (research D2, ADR-0002).
+    global _executor
+    if _executor is not None:
+        _executor.shutdown(wait=False)
+    _executor = ThreadPoolExecutor(
+        max_workers=_max_concurrent, thread_name_prefix="xvd-download"
+    )
+
+
+def shutdown(wait: bool = False) -> None:
+    """Stop accepting work. Called at exit.
+
+    Defaults to NOT waiting: a download runs for minutes, and blocking process
+    exit on one would make every restart and deploy hang. An abandoned job is
+    recovered as interrupted on the next start-up, which is what FR-025 already
+    specifies should happen to it.
+
+    `wait=True` exists for tests. Without it a worker outlives the process state
+    it was started under, and since _jobs_dir is module-global, a straggler from
+    one test writes its record into the next test's directory.
+    """
+    global _executor
+    if _executor is not None:
+        _executor.shutdown(wait=wait)
+        _executor = None
 
 
 def _require_init() -> None:
@@ -252,3 +287,284 @@ def persist(job: Job) -> None:
             raise
     except OSError:
         _log.exception("could not persist job record for %s", job.handle)
+
+
+# --------------------------------------------------------------------------
+# Handles and the registry
+# --------------------------------------------------------------------------
+
+# 32 bytes -> 256 bits of entropy in a 43-character string. SC-011 asks for at
+# least 128; 16 bytes would meet it exactly and 32 costs nothing. This is the
+# only credential in the system -- possession of the handle IS the authorization
+# (spec Q1) -- so the margin is the security argument, not decoration.
+_HANDLE_BYTES = 32
+
+_registry: dict[str, Job] = {}
+
+
+def _mint_handle() -> str:
+    return secrets.token_urlsafe(_HANDLE_BYTES)
+
+
+def get(handle: str) -> Job | None:
+    """Look a job up by its handle. Never touches the filesystem.
+
+    That is the point, not an optimisation. Because the lookup is a dict hit, a
+    caller-supplied string cannot become a path component no matter what it
+    contains -- there is no code path from a request to the filesystem by handle
+    at all. Only handles this module minted are ever turned into filenames
+    (research D3). api.py applies a syntactic check as a cheap second layer.
+    """
+    with _lock:
+        return _registry.get(handle)
+
+
+# --------------------------------------------------------------------------
+# Submission
+# --------------------------------------------------------------------------
+
+
+def submit(
+    url: str,
+    client_address: str,
+    *,
+    download: Callable[..., DownloadOutcome] = download_post,
+) -> Job:
+    """Accept a URL and return immediately with a job. Does not download.
+
+    `download` is a test seam and nothing else: tests/test_jobs.py passes a
+    plain stub so the state machine can be exercised without a network call
+    (Principle II permits fakes, not mocking frameworks). It is keyword-only and
+    api.py never passes it. It MUST NOT be wired to anything a caller supplies.
+
+    Raises ValueError for a rejected URL, which api.py maps to 400. No job is
+    created and no network request is made on that path (FR-003).
+    """
+    _require_init()
+
+    # The Principle V gate, first, before anything is created or reserved. The
+    # frozen parse_post_url is the only allowlist in the service; this adds no
+    # second validation path and no bypass. download_post validates again
+    # internally, which is the gate no caller can skip -- this call does not
+    # replace it.
+    reference = parse_post_url(url)
+
+    with _lock:
+        # Deduplicate on the canonical URL rather than the post id, because
+        # canonical_url already distinguishes /video/1 from the bare post URL
+        # and those produce different files (FR-017, ADR-0001). Check and insert
+        # are inside one lock, or five simultaneous submissions of one post
+        # would start five downloads (SC-007).
+        for existing in _registry.values():
+            if existing.canonical_url == reference.canonical_url and existing.state in (
+                WAITING,
+                RUNNING,
+            ):
+                return existing
+
+        job = Job(
+            handle=_mint_handle(),
+            canonical_url=reference.canonical_url,
+            client_address=client_address,
+        )
+        _registry[job.handle] = job
+
+    persist(job)
+
+    assert _executor is not None  # narrowed by _require_init
+    _executor.submit(_run_job, job, download)
+    return job
+
+
+# --------------------------------------------------------------------------
+# The worker
+# --------------------------------------------------------------------------
+
+
+def _make_progress_hook(job: Job) -> Callable[[dict], None]:
+    """Update the job's progress from yt-dlp's status dict. Memory only.
+
+    Never persists (research D3). Best-effort by requirement: a missing total is
+    normal for HLS, and for a multi-video post the figures restart per video, so
+    FR-008 makes progress advisory rather than monotonic.
+
+    The job time limit will be enforced from inside this callback in a later
+    phase. It is not enforced here yet.
+    """
+
+    def hook(status: dict) -> None:
+        if status.get("status") != "downloading":
+            return
+        job.downloaded_bytes = status.get("downloaded_bytes")
+        job.total_bytes = status.get("total_bytes") or status.get("total_bytes_estimate")
+
+    return hook
+
+
+def _make_warning_hook(job: Job) -> Callable[[str], None]:
+    """Route downloader warnings to the log and nowhere else.
+
+    The only warning it currently sends names a temporary directory
+    (downloader.py:309-312), so this text is exactly what must never reach a
+    caller (FR-029).
+    """
+
+    def hook(message: str) -> None:
+        _log.warning("job %s: %s", job.handle, message)
+
+    return hook
+
+
+def _run_job(job: Job, download: Callable[..., DownloadOutcome]) -> None:
+    """Run one download to completion. Executes on a pool worker, never on a request."""
+    with _lock:
+        if job.state != WAITING:
+            return
+        job.state = RUNNING
+        job.started_at = time.time()
+    persist(job)
+
+    assert _output_dir is not None  # narrowed by _require_init in submit()
+    try:
+        outcome = download(
+            job.canonical_url,
+            _output_dir,
+            progress=_make_progress_hook(job),
+            on_warning=_make_warning_hook(job),
+        )
+    except ValueError:
+        # download_post raises this for metadata it refuses to guess at, and
+        # build_target raises it naming both the candidate path and the output
+        # root (validation.py:186). Logged in full, never carried forward.
+        _log.exception("job %s: download raised ValueError", job.handle)
+        _finish(job, FAILED, failure_code=UNCLASSIFIED)
+        return
+    except BaseException:
+        _log.exception("job %s: download raised unexpectedly", job.handle)
+        _finish(job, FAILED, failure_code=UNCLASSIFIED)
+        return
+
+    _record_outcome(job, outcome)
+
+
+def _finish(
+    job: Job,
+    state: str,
+    *,
+    failure_code: str | None = None,
+    files: tuple[Path, ...] = (),
+) -> None:
+    """Apply a terminal transition and persist it, if the job is not already done."""
+    with _lock:
+        applied = _enter_terminal(job, state, failure_code=failure_code, files=files)
+    if applied:
+        persist(job)
+
+
+# --------------------------------------------------------------------------
+# Outcome -> terminal state
+# --------------------------------------------------------------------------
+
+# The deliberate, visible fallback of FR-011. Declared here because _run_job
+# needs it before the classification table exists; the rest of the codes and the
+# prefix map arrive with _classify below.
+UNCLASSIFIED = "unclassified"
+
+
+def _classify(message: str) -> str:
+    """Map a DownloadOutcome.message to a failure code.
+
+    T009 placeholder: every failure classifies as unclassified until T013 adds
+    the prefix table. Left deliberately incomplete rather than reordering the
+    tasks, so the drift test that pins the table lands as its own named
+    deliverable.
+    """
+    return UNCLASSIFIED
+
+
+def _record_outcome(job: Job, outcome: DownloadOutcome) -> None:
+    """Turn a DownloadOutcome into a terminal state.
+
+    "skipped" is a success, not a lesser one: feature 001 returns it when the
+    target file is already on disk, and the caller gets the same file either way
+    (FR-016).
+
+    outcome.message is logged and then dropped. It is never stored on the job,
+    because the record has no field that could hold it -- see the Job docstring.
+    """
+    if outcome.status in ("downloaded", "skipped"):
+        _finish(job, FINISHED, files=tuple(outcome.paths))
+        return
+
+    _log.info("job %s failed: %s", job.handle, outcome.message)
+    _finish(job, FAILED, failure_code=_classify(outcome.message))
+
+
+# --------------------------------------------------------------------------
+# File selection
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FileResult:
+    """Which file to serve, or why none can be served.
+
+    Returns a problem code rather than raising, mirroring how downloader.py
+    returns DownloadOutcome instead of inventing an exception hierarchy
+    (Principle VI). api.py maps `problem` to a status code and a fixed sentence;
+    `file_count` is what lets it name the count in an index-required refusal
+    without this module composing any caller-visible text.
+    """
+
+    path: Path | None
+    problem: str | None
+    file_count: int
+
+
+def file_for(job: Job, index: int | None = None) -> FileResult:
+    """Resolve which of a finished job's files to serve (FR-035, FR-036).
+
+    No index and exactly one file returns that file: an index is NEVER required
+    for the single-video case, which is the common one (spec Q2). No index and
+    several files is a refusal naming the count, not an error -- the caller then
+    asks again with an index.
+
+    The path comes only from the job's own recorded result, never from anything
+    in a request (FR-030).
+    """
+    if job.state == EXPIRED:
+        return FileResult(None, EXPIRED, len(job.files))
+    if job.state == FAILED:
+        return FileResult(None, FAILED, 0)
+    if job.state != FINISHED:
+        return FileResult(None, "not_ready", 0)
+
+    count = len(job.files)
+    if count == 0:
+        # A finished job with no files means an invariant broke rather than a
+        # caller doing anything wrong. Reported as expired, which is the truthful
+        # answer to "can I have the file": no, and not because you asked wrongly.
+        _log.error("job %s is finished but recorded no files", job.handle)
+        return FileResult(None, EXPIRED, 0)
+
+    if index is None:
+        if count > 1:
+            return FileResult(None, "index_required", count)
+        chosen = job.files[0]
+    else:
+        # 1-based, matching the index the frozen build_target puts in filenames.
+        # Anything out of range is refused; there is deliberately no clamping,
+        # because silently serving file 1 to someone who asked for file 9 is the
+        # wrong-file class of bug ADR-0001 exists to prevent.
+        if index < 1 or index > count:
+            return FileResult(None, "not_found", count)
+        chosen = job.files[index - 1]
+
+    # Re-check at serve time. Retention does not exist yet, but an operator can
+    # still delete a file, and FR-014 forbids handing back a partial or empty
+    # body in that case.
+    if not chosen.is_file():
+        _log.warning("job %s: recorded file is gone", job.handle)
+        return FileResult(None, EXPIRED, count)
+
+    return FileResult(chosen, None, count)
