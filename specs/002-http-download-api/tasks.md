@@ -18,7 +18,7 @@ description: "Task list for 002-http-download-api — Phase 1 (US1 + US3), Phase
 | Phase 2 | US2 | — | not generated |
 | Phase 3 | US4 | T029–T043 | code complete; **T043 awaits the owner** |
 | Phase 4 | US5 | T044–T050 | code complete; **T049 awaits the owner** |
-| **Phase 5** | **US6** | **T051–T060** | **generated below** |
+| Phase 5 | US6 | T051–T060 | code complete; **T059 awaits the owner** |
 
 All three outstanding tasks are the 🚦 manual verifications, which the owner runs. Nothing else is
 open.
@@ -1117,7 +1117,7 @@ inspects the registry — no restart, no subprocess, no HTTP.
 
 All six tasks edit `backend/jobs.py` and run in sequence.
 
-- [ ] **T051** [US6] Add `_from_record(data, expected_handle) -> Job | None` to `backend/jobs.py`.
+- [X] **T051** [US6] Add `_from_record(data, expected_handle) -> Job | None` to `backend/jobs.py`.
   - The exact inverse of `_as_record` (`backend/jobs.py:358`). `files` comes back as a list of
     strings and MUST become `tuple(Path(...))` — the same type `DownloadOutcome.paths` produces, or
     `file_for` will be comparing the wrong thing.
@@ -1129,7 +1129,7 @@ All six tasks edit `backend/jobs.py` and run in sequence.
   - `timed_out` is deliberately absent from the record (T035) — default it to `False`. A restart ends
     the process that could have been timing out.
 
-- [ ] **T052** [US6] Implement `recover()` in `backend/jobs.py` — the read side of FR-024.
+- [X] **T052** [US6] Implement `recover()` in `backend/jobs.py` — the read side of FR-024.
   - Iterate `<state_dir>/jobs/*.json`, skipping the `.tmp-job-*` files `persist` may have left behind
     (`backend/jobs.py:401`). Those are half-written by definition and must never be parsed.
   - Build the registry from what parses. Log one WARNING per skipped file and one summary line with
@@ -1141,7 +1141,7 @@ All six tasks edit `backend/jobs.py` and run in sequence.
   - `recover()` returns a count of what it loaded, so T057 can log one line an operator can read on
     boot rather than leaving start-up silent about it.
 
-- [ ] **T053** [US6] Resolve non-terminal recovered jobs in `backend/jobs.py` (FR-025).
+- [X] **T053** [US6] Resolve non-terminal recovered jobs in `backend/jobs.py` (FR-025).
   - Any record read as `waiting` or `running` → `failed` with `failure_code=INTERRUPTED`, and
     **persisted before `recover()` returns** (decision 1). The code and its caller-safe sentence
     already exist (`backend/jobs.py:FAILURE_MESSAGES`); this is the first thing that assigns it.
@@ -1155,7 +1155,7 @@ All six tasks edit `backend/jobs.py` and run in sequence.
     is retried by the first sweep of the new process. That continuity is free and worth a comment —
     it is the one place where recovery and T046's retry meet.
 
-- [ ] **T054** [US6] Sweep abandoned `.tmp-xvd-*` directories in `backend/jobs.py` (FR-026).
+- [X] **T054** [US6] Sweep abandoned `.tmp-xvd-*` directories in `backend/jobs.py` (FR-026).
   - Match `.tmp-xvd-*` directories directly under `_output_dir` — the prefix
     `backend/downloader.py:493` uses. Directories only; never touch a file at that level, which would
     be somebody's video.
@@ -1171,7 +1171,7 @@ All six tasks edit `backend/jobs.py` and run in sequence.
     rather than left for implementation, since the flaw was known the moment it was found. Read it
     before writing the threshold; do not re-derive the number.
 
-- [ ] **T055** [US6] Confirm recovered `finished` jobs are still retrievable, in `backend/jobs.py`.
+- [X] **T055** [US6] Confirm recovered `finished` jobs are still retrievable, in `backend/jobs.py`.
   - Mostly an assertion that nothing extra is needed: `file_for` re-checks existence
     (`backend/jobs.py:733-735`) and reports `expired` when a file is gone, which is the correct answer
     for a file an operator deleted between runs.
@@ -1181,7 +1181,7 @@ All six tasks edit `backend/jobs.py` and run in sequence.
   - If anything beyond the type conversion turns out to be required, **stop and report**: it would
     mean the record shape is lossy, which is a data-model problem rather than a coding one.
 
-- [ ] **T056** [US6] Extend `tests/test_jobs.py` for recovery.
+- [X] **T056** [US6] Extend `tests/test_jobs.py` for recovery.
   - **The reconciliation property (decision 1)**: after `recover()`, every file in the jobs directory
     deserialises to a job equal to the registry's. This is the "must not disagree" requirement made
     falsifiable.
@@ -1206,7 +1206,7 @@ what the last one was doing. `backend/api.py` is still unchanged by this phase.
 
 ## Phase 14: US6 transport — `backend/api.py` (Priority: P3)
 
-- [ ] **T057** [US6] Call `recover()` from the lifespan in `backend/api.py`, before anything else.
+- [X] **T057** [US6] Call `recover()` from the lifespan in `backend/api.py`, before anything else.
   - Order: `jobs.init()` → `jobs.recover()` → `asyncio.create_task(_sweep_loop())` → `yield`
     (decision 5). The sweep must not run against a half-built registry.
   - Log one line with the recovered count, so a boot is not silent about having adopted state.
@@ -1220,7 +1220,7 @@ what the last one was doing. `backend/api.py` is still unchanged by this phase.
 
 ## Phase 15: Verification and close
 
-- [ ] **T058** [US6] Assert recovery completes before the service can be observed, in
+- [X] **T058** [US6] Assert recovery completes before the service can be observed, in
   `tests/test_jobs.py`.
   - Structural, since this file may not construct an HTTP client: parse `api.py`, find `lifespan`,
     and assert `jobs.recover()` is called **before** `create_task` and before the `yield`.
@@ -1297,6 +1297,37 @@ intermediate state where half of recovery is shipped.
 
 After T056 (the service layer, complete and tested) and after T058. T059 is the owner's, and T060 is
 the close-out commit.
+
+### Found during T057, and deliberately not fixed here
+
+**FR-033 is not satisfied in a default deployment.** Verified against uvicorn 0.52.2 while watching a
+real boot recover a real state directory:
+
+- uvicorn configures exactly three loggers — `uvicorn`, `uvicorn.access`, `uvicorn.error`
+  (`uvicorn.config.LOGGING_CONFIG`). Ours are not among them.
+- `xvd.jobs` and `xvd.api` therefore have **no handlers**, and fall through to
+  `logging.lastResort`, whose level is **WARNING**.
+- So every `_log.info(...)` in the package is **invisible in production**. Confirmed empirically: an
+  INFO line emitted under uvicorn's own logging config produced no output, while a WARNING did.
+
+What that costs, in requirement terms:
+
+| Line | Level | Requirement | Visible? |
+|---|---|---|---|
+| `_record_outcome`: `"job %s failed: %s"` with the raw downloader message | INFO | **FR-033** — the operator's only correlation between a caller's failure code and the real cause | **no** |
+| recovery's start-up summary | INFO | operability | no |
+| `"job %s expired after its retention period"` | INFO | operability | no |
+| `xvd-wedged-worker` | WARNING | ADR-0002 mitigation | yes, but with no timestamp or logger name |
+
+FR-033 says diagnostic detail "MUST be available to the operator for every failure, and MUST be
+correlatable to the caller-visible response". The code writes exactly that line; nothing carries it
+anywhere. **The disclosure boundary is intact — this is the opposite failure, detail withheld from
+the operator rather than leaked to the caller.**
+
+Not fixed in this phase because it is US3's requirement, not US6's, and the standing instruction is
+to stop and report rather than improvise. The fix is small and belongs in its own task: configure the
+`xvd` logger namespace at start-up — a handler, a level from an environment variable defaulting to
+INFO, and a format carrying a timestamp and the logger name.
 
 ### What remains after T060
 

@@ -390,9 +390,9 @@ def persist(job: Job) -> None:
     what degrades is the accuracy of a restart recovery that does not exist yet.
     Raising here would fail a download over a bookkeeping problem.
 
-    Only the write side. Reading records back is FR-024/FR-025 and belongs to a
-    later phase; writing now avoids retrofitting persistence into every
-    transition then.
+    The reader is _from_record below. That it arrived three phases later is why
+    persist() was written first: retrofitting persistence into every transition
+    afterwards would have touched all of them.
     """
     _require_init()
     assert _jobs_dir is not None  # narrowed by _require_init
@@ -413,6 +413,83 @@ def persist(job: Job) -> None:
             raise
     except OSError:
         _log.exception("could not persist job record for %s", job.handle)
+
+
+_ALL_STATES = frozenset({WAITING, RUNNING, FINISHED, FAILED, EXPIRED})
+
+
+def _from_record(data: object, expected_handle: str) -> "Job | None":
+    """The inverse of _as_record. Returns None for anything untrustworthy.
+
+    Returns rather than raises because a bad file is expected input at this
+    boundary, not an exceptional condition -- the same reasoning that makes
+    FileResult and SubmitResult records instead of exceptions (Principle VI).
+    One unreadable record costs one job; letting it propagate would cost the
+    service a start-up.
+
+    Four ways a record can be untrustworthy, all treated identically:
+
+    * not an object, or missing a field -- a half-written record has no correct
+      interpretation, and os.replace makes it nearly impossible anyway;
+    * a handle that is not handle-shaped;
+    * a handle that disagrees with the filename it was found under -- nothing
+      this service writes can do that, so the state directory has been edited;
+    * a state we do not recognise, which most likely means a record written by
+      a LATER version and read after a downgrade. Interrupting it would
+      mislabel it; skipping loses one job and keeps the rest.
+
+    `timed_out` is deliberately not in the record (it is a within-process signal
+    between the progress hook and the worker) and defaults to False. The process
+    that could have been timing out is gone.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    handle = data.get("handle")
+    if not isinstance(handle, str) or handle != expected_handle or not is_valid_handle(handle):
+        return None
+
+    state = data.get("state")
+    if state not in _ALL_STATES:
+        return None
+
+    canonical_url = data.get("canonical_url")
+    client_address = data.get("client_address")
+    created_at = data.get("created_at")
+    if not isinstance(canonical_url, str) or not isinstance(client_address, str):
+        return None
+    if not isinstance(created_at, (int, float)):
+        return None
+
+    files = data.get("files")
+    if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+        return None
+
+    return Job(
+        handle=handle,
+        canonical_url=canonical_url,
+        client_address=client_address,
+        state=state,
+        created_at=float(created_at),
+        started_at=_optional_float(data.get("started_at")),
+        completed_at=_optional_float(data.get("completed_at")),
+        downloaded_bytes=_optional_int(data.get("downloaded_bytes")),
+        total_bytes=_optional_int(data.get("total_bytes")),
+        # Back to Path, and back to a tuple. DownloadOutcome.paths produces the
+        # same shape, and file_for calls .is_file() on whatever is in here -- a
+        # list of strings left as-is would fail on the first retrieval after a
+        # restart, which nothing before this phase could have caught.
+        files=tuple(Path(item) for item in files),
+        failure_code=data.get("failure_code") if isinstance(data.get("failure_code"), str) else None,
+    )
+
+
+def _optional_float(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _optional_int(value: object) -> int | None:
+    return int(value) if isinstance(value, (int, float)) else None
 
 
 # --------------------------------------------------------------------------
@@ -1220,6 +1297,151 @@ def health() -> dict:
         "waiting": waiting,
         "wedged_workers": wedged,
     }
+
+
+# --------------------------------------------------------------------------
+# Start-up recovery (FR-024 read side, FR-025, FR-026)
+#
+# Authority, which is only ambiguous during this function:
+#
+#   before recover()   the registry is empty; disk is the only truth
+#   during recover()   disk is read, memory is built from it, and any record
+#                      recovery CHANGES is written back before returning
+#   after recover()    memory is authoritative; disk is a write-only mirror
+#                      (research D3)
+#
+# The middle clause is load-bearing. A job resolved to failed/interrupted must
+# reach disk inside this function, or a second crash before the next write would
+# read it back as running again -- and it could ping-pong across restarts
+# indefinitely, which is exactly the permanently-misleading job FR-025 exists to
+# prevent.
+# --------------------------------------------------------------------------
+
+
+def recover() -> int:
+    """Rebuild the registry from disk. Call once, at start-up. Returns the count.
+
+    NOT called from init(). init() runs repeatedly in tests and would hand each
+    one a surprise registry; reading the disk is a start-up event, and the
+    lifespan is where start-up lives.
+
+    A missing or empty jobs directory is a normal first start, not an error.
+    """
+    _require_init()
+    assert _jobs_dir is not None  # narrowed by _require_init
+
+    loaded: list[Job] = []
+    skipped = 0
+
+    for path in sorted(_jobs_dir.glob("*.json")):
+        # persist() writes through .tmp-job-* siblings; one left behind by a
+        # crash is half-written by definition and must never be parsed.
+        if path.name.startswith(".tmp-job-"):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _log.warning("skipping unreadable job record %s", path.name, exc_info=True)
+            skipped += 1
+            continue
+
+        job = _from_record(data, path.stem)
+        if job is None:
+            _log.warning("skipping untrustworthy job record %s", path.name)
+            skipped += 1
+            continue
+        loaded.append(job)
+
+    interrupted = []
+    with _lock:
+        for job in loaded:
+            _registry[job.handle] = job
+            if job.state in (WAITING, RUNNING):
+                # Not requeued (FR-025, spec Q3). A restart is usually a deploy
+                # or an OOM kill, and re-running every in-flight download on
+                # boot would turn one bad deploy into a thundering herd against
+                # X. The caller is told, and FAILURE_MESSAGES[INTERRUPTED]
+                # already invites them to submit it again.
+                if _enter_terminal(job, FAILED, failure_code=INTERRUPTED):
+                    interrupted.append(job)
+
+    # Written back HERE, before this function returns. See the authority note
+    # above -- deferring it is what lets a job ping-pong across restarts.
+    for job in interrupted:
+        persist(job)
+
+    if skipped:
+        _log.warning("recovery skipped %d unreadable or untrustworthy record(s)", skipped)
+    _log.info(
+        "recovered %d job record(s); %d were interrupted by the previous stop",
+        len(loaded),
+        len(interrupted),
+    )
+    return len(loaded)
+
+
+def sweep_abandoned_temp_dirs(
+    *,
+    now: Callable[[], float] = time.time,
+    remove: Callable[[Path], None] = lambda path: shutil.rmtree(path),
+) -> int:
+    """Remove abandoned .tmp-xvd-* directories from the output directory (FR-026).
+
+    An abrupt stop bypasses the cleanup download_post performs itself
+    (downloader.py:536-541), so these accumulate as a slow disk leak.
+
+    ONLY directories older than XVD_JOB_TIMEOUT, and that threshold is the whole
+    safety argument rather than a tuning knob. research.md D7 originally claimed
+    that running this only at start-up meant it could not delete a live CLI
+    download's temp directory. That does not follow: start-up-only limits how
+    OFTEN this runs, not whether a CLI download is in flight when it does. The
+    CLI shipped in feature 001 and shares the output directory by design, so an
+    operator restarting the service mid-CLI-download would have had it deleted
+    underneath them.
+
+    The age test closes that. No download of ours can legitimately be older than
+    the job timeout -- the watchdog fails it at exactly that age -- so anything
+    older is certainly abandoned. A younger directory is left for a later
+    restart, costing one interval of disk.
+
+    START-UP ONLY. Deliberately not part of sweep(): running it periodically
+    would reintroduce the race the age test exists to close, since a CLI
+    download can begin at any time while the service is up.
+    """
+    _require_init()
+    assert _output_dir is not None  # narrowed by _require_init
+
+    cutoff = now() - _job_timeout
+    removed = 0
+
+    try:
+        candidates = sorted(_output_dir.glob(".tmp-xvd-*"))
+    except OSError:
+        _log.warning("could not list the output directory for leftovers", exc_info=True)
+        return 0
+
+    for path in candidates:
+        # Directories only. A file matching this pattern at this level is not
+        # something we created, and deleting it would be deleting somebody's
+        # data on a guess.
+        if not path.is_dir():
+            continue
+        try:
+            if path.stat().st_mtime > cutoff:
+                _log.info("leaving recent temp directory %s alone", path.name)
+                continue
+            remove(path)
+        except OSError:
+            # Same tolerance as _delete_files and downloader.py:270-292: a
+            # leftover that cannot be removed is a disk problem, not a reason to
+            # refuse to start.
+            _log.warning("could not remove leftover %s", path.name, exc_info=True)
+            continue
+        removed += 1
+
+    if removed:
+        _log.info("removed %d abandoned temp director(ies)", removed)
+    return removed
 
 
 # --------------------------------------------------------------------------

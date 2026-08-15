@@ -1154,6 +1154,322 @@ def test_enter_terminal_still_refuses_to_leave_a_terminal_state(service, tmp_pat
 
 
 # --------------------------------------------------------------------------
+# Restart recovery (US6: FR-024 read side, FR-025, FR-026)
+#
+# No subprocess and no real restart. A restart IS "a fresh registry plus the
+# state directory the last process left", so these tests write records, clear
+# the registry, and call recover() -- which exercises exactly the code a real
+# boot runs, without the six seconds a real boot costs.
+# --------------------------------------------------------------------------
+
+
+def _write_record(service, **overrides):
+    """Put a job record on disk the way a previous process would have left it."""
+    handle = overrides.pop("handle", None) or jobs._mint_handle()
+    job = jobs.Job(
+        handle=handle,
+        canonical_url=BARE_URL,
+        client_address="203.0.113.7",
+    )
+    for name, value in overrides.items():
+        setattr(job, name, value)
+    service.persist(job)
+    return job
+
+
+def _restart(service):
+    """What a new process sees: no memory, the same disk."""
+    service._registry.clear()
+    return service.recover()
+
+
+def _record_on_disk(service, handle):
+    return json.loads((service._jobs_dir / f"{handle}.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("state", ["waiting", "running"])
+def test_a_non_terminal_job_is_recovered_as_interrupted(service, state):
+    """FR-025: nothing may report running forever."""
+    written = _write_record(service, state=state, started_at=1_000_000.0)
+
+    assert _restart(service) == 1
+    job = service.get(written.handle)
+
+    assert job.state == jobs.FAILED
+    assert job.failure_code == jobs.INTERRUPTED
+    assert job.completed_at is not None
+    assert jobs.FAILURE_MESSAGES[job.failure_code]
+
+
+@pytest.mark.parametrize("state", ["waiting", "running"])
+def test_the_interrupted_verdict_reaches_disk_inside_recover(service, state):
+    """The write-back clause, which is the whole reason recovery persists.
+
+    Without it the registry would say `failed` while the file still said
+    `running`, and a second crash before any later write would read the job
+    back as running again -- ping-ponging across restarts forever.
+
+    Asserted by re-reading the FILE, not the registry. Reading the registry
+    would pass whether or not anything was written.
+    """
+    written = _write_record(service, state=state, started_at=1_000_000.0)
+    _restart(service)
+
+    assert _record_on_disk(service, written.handle)["state"] == "failed"
+    assert _record_on_disk(service, written.handle)["failure_code"] == "interrupted"
+
+
+def test_a_second_restart_does_not_resurrect_an_interrupted_job(service):
+    """The ping-pong, driven rather than argued about.
+
+    This is the failure a single restart cannot reveal, and the only test here
+    that fails if the write-back is deferred to some later transition.
+    """
+    written = _write_record(service, state="running", started_at=1_000_000.0)
+
+    _restart(service)
+    _restart(service)  # a second crash, a second boot, nothing in between
+
+    job = service.get(written.handle)
+    assert job.state == jobs.FAILED
+    assert job.failure_code == jobs.INTERRUPTED
+
+
+def test_disk_and_registry_agree_after_recovery(service, tmp_path):
+    """The reconciliation property: no record may disagree with its job.
+
+    Written as a property over EVERY record rather than as a spot check, so a
+    state added later is covered without anyone remembering to extend this.
+    """
+    _write_record(service, state="waiting")
+    _write_record(service, state="running", started_at=1_000_000.0)
+    _write_record(service, state="finished", completed_at=1_000_000.0,
+                  files=(tmp_path / "out" / "a.mp4",))
+    _write_record(service, state="failed", failure_code=jobs.NO_VIDEO,
+                  completed_at=1_000_000.0)
+    _write_record(service, state="expired", completed_at=1_000_000.0,
+                  files=(tmp_path / "out" / "b.mp4",))
+
+    _restart(service)
+
+    for path in service._jobs_dir.glob("*.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        job = service.get(path.stem)
+        assert job is not None, f"{path.name} is on disk but not in the registry"
+        assert service._as_record(job) == data, f"{path.name} disagrees with the registry"
+
+
+def test_a_finished_job_survives_and_stays_retrievable(service, tmp_path):
+    """US6 acceptance scenario 3."""
+    original, files = _finished(service, tmp_path)
+
+    assert _restart(service) == 1
+    job = service.get(original.handle)
+
+    assert job.state == jobs.FINISHED
+    assert job.failure_code is None
+    # Path objects, not strings. file_for calls .is_file() on these.
+    assert all(isinstance(item, Path) for item in job.files)
+    assert service.file_for(job).path == files[0]
+
+
+def test_a_finished_job_whose_file_vanished_reports_expired(service, tmp_path):
+    """An operator deleted it between runs. Never a partial body (FR-014)."""
+    original, files = _finished(service, tmp_path)
+    files[0].unlink()
+
+    _restart(service)
+    job = service.get(original.handle)
+
+    assert job.state == jobs.FINISHED
+    assert service.file_for(job).problem == jobs.EXPIRED
+
+
+def test_an_expired_job_keeps_its_files_for_the_retry(service, tmp_path):
+    """Where recovery and the Windows delete retry meet.
+
+    A delete that failed before the restart is retried by the first sweep of the
+    new process, which only works if the paths survived the round trip.
+    """
+    leftover = tmp_path / "out" / "still-here.mp4"
+    leftover.parent.mkdir(parents=True, exist_ok=True)
+    leftover.write_bytes(b"not deleted yet")
+    written = _write_record(service, state="expired", completed_at=1_000_000.0,
+                            files=(leftover,))
+
+    _restart(service)
+    job = service.get(written.handle)
+    assert job.state == jobs.EXPIRED
+    assert job.files == (leftover,)
+
+    service.sweep(now=lambda: 1_000_000.0 + service._retention + 1)
+    assert not leftover.exists()
+
+
+def test_recovery_does_not_requeue_anything(service, monkeypatch):
+    """FR-025/Q3. A restart is usually a deploy; re-running every in-flight
+    download on boot would turn one bad deploy into a thundering herd."""
+    _write_record(service, state="waiting")
+    _write_record(service, state="running", started_at=1_000_000.0)
+
+    submitted = []
+    real_submit = service._executor.submit
+    monkeypatch.setattr(
+        service._executor,
+        "submit",
+        lambda *args, **kwargs: submitted.append(args) or real_submit(lambda: None),
+    )
+
+    _restart(service)
+    assert submitted == []
+
+
+def test_recovery_is_a_no_op_on_a_fresh_install(service):
+    assert _restart(service) == 0
+    assert service._registry == {}
+
+
+# --- Records that cannot be trusted (all skipped, none fatal) --------------
+
+
+def test_unreadable_records_are_skipped_without_stopping_recovery(service):
+    """One bad file costs one job. A crash-loop would cost the service."""
+    good = _write_record(service, state="finished", completed_at=1.0)
+    handle = jobs._mint_handle()
+
+    # Truncated JSON.
+    (service._jobs_dir / f"{handle}.json").write_text('{"handle": "trunc', encoding="utf-8")
+    # Valid JSON, but not an object.
+    (service._jobs_dir / f"{jobs._mint_handle()}.json").write_text("[]", encoding="utf-8")
+
+    assert _restart(service) == 1
+    assert service.get(good.handle) is not None
+
+
+def test_a_record_disagreeing_with_its_filename_is_skipped(service):
+    """Nothing this service writes can do that, so the directory was edited."""
+    written = _write_record(service, state="finished", completed_at=1.0)
+    data = _record_on_disk(service, written.handle)
+    data["handle"] = jobs._mint_handle()  # valid shape, wrong file
+    (service._jobs_dir / f"{written.handle}.json").write_text(json.dumps(data), encoding="utf-8")
+
+    assert _restart(service) == 0
+
+
+def test_a_record_with_an_unrecognised_state_is_skipped(service):
+    """Most likely a downgrade -- a record written by a later version.
+
+    Interrupting it would mislabel it; skipping loses one job and keeps the
+    rest.
+    """
+    written = _write_record(service, state="finished", completed_at=1.0)
+    data = _record_on_disk(service, written.handle)
+    data["state"] = "quarantined-by-a-future-version"
+    (service._jobs_dir / f"{written.handle}.json").write_text(json.dumps(data), encoding="utf-8")
+
+    assert _restart(service) == 0
+
+
+def test_a_record_missing_a_field_is_skipped(service):
+    written = _write_record(service, state="finished", completed_at=1.0)
+    data = _record_on_disk(service, written.handle)
+    del data["canonical_url"]
+    (service._jobs_dir / f"{written.handle}.json").write_text(json.dumps(data), encoding="utf-8")
+
+    assert _restart(service) == 0
+
+
+def test_a_leftover_temp_write_is_never_parsed(service):
+    """persist() writes through .tmp-job-* siblings; a crash can strand one."""
+    good = _write_record(service, state="finished", completed_at=1.0)
+    (service._jobs_dir / ".tmp-job-abcdef.json").write_text("{ half written", encoding="utf-8")
+
+    assert _restart(service) == 1
+    assert service.get(good.handle) is not None
+
+
+# --- The abandoned temp-directory sweep (FR-026) ---------------------------
+
+
+def _temp_dir(service, name=".tmp-xvd-abandoned", age=0.0):
+    path = service._output_dir / name
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "fragment.part").write_bytes(b"half a video")
+    if age:
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_an_abandoned_temp_directory_is_removed(service):
+    old = _temp_dir(service, age=service._job_timeout + 60)
+    assert service.sweep_abandoned_temp_dirs() == 1
+    assert not old.exists()
+
+
+def test_a_recent_temp_directory_survives_the_sweep(service):
+    """The age guard, demonstrated protecting something.
+
+    A CLI download shares the output directory by design (feature 001), and it
+    can be in flight at the moment the service starts. Deleting its temp
+    directory would corrupt a download this service does not own. Anything
+    younger than the job timeout might be exactly that, so it is left alone --
+    the watchdog guarantees nothing of OURS is ever that young and still live.
+    """
+    live = _temp_dir(service, name=".tmp-xvd-a-cli-run-in-progress", age=0.0)
+
+    assert service.sweep_abandoned_temp_dirs() == 0
+    assert live.exists()
+    assert (live / "fragment.part").exists()
+
+
+def test_the_guard_is_the_job_timeout_not_a_fixed_number(service, monkeypatch):
+    """Same directory, two configurations, opposite outcomes."""
+    monkeypatch.setenv("XVD_JOB_TIMEOUT", "3600")
+    service.init()
+    path = _temp_dir(service, age=1800)
+    assert service.sweep_abandoned_temp_dirs() == 0
+    assert path.exists()
+
+    monkeypatch.setenv("XVD_JOB_TIMEOUT", "600")
+    service.init()
+    assert service.sweep_abandoned_temp_dirs() == 1
+    assert not path.exists()
+
+
+def test_the_sweep_never_touches_a_file_or_an_unrelated_directory(service):
+    """A file matching the pattern is not ours, and deleting it would be
+    deleting somebody's data on a guess."""
+    video = service._output_dir / ".tmp-xvd-looks-like-one.mp4"
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(b"a real video, awkwardly named")
+    os.utime(video, (0, 0))
+
+    unrelated = service._output_dir / "my-videos"
+    unrelated.mkdir(parents=True, exist_ok=True)
+    os.utime(unrelated, (0, 0))
+
+    assert service.sweep_abandoned_temp_dirs() == 0
+    assert video.exists()
+    assert unrelated.exists()
+
+
+def test_a_removal_that_fails_does_not_stop_start_up(service, caplog):
+    """Windows holds handles; a leftover that cannot go is not a reason to
+    refuse to boot. But it must be visible."""
+    stuck = _temp_dir(service, age=service._job_timeout + 60)
+
+    def refusing(path):
+        raise PermissionError(32, "The process cannot access the file")
+
+    with caplog.at_level("WARNING", logger="xvd.jobs"):
+        assert service.sweep_abandoned_temp_dirs(remove=refusing) == 0
+
+    assert stuck.exists()
+    assert any("could not remove leftover" in record.message for record in caplog.records)
+
+
+# --------------------------------------------------------------------------
 # The Principle III boundary (T025)
 #
 # Feature 001 checked this with `grep -nE "argparse|sys\.exit|print\("` and the
@@ -1348,6 +1664,60 @@ def test_the_transport_still_handles_the_expired_state():
         and isinstance(node.args[0], ast.Constant)
     }
     assert 410 in statuses, "the expired refusal is no longer a 410 (FR-022)"
+
+
+def test_recovery_runs_before_anything_can_observe_the_registry():
+    """The ordering inside lifespan, which is the half of the guarantee we own.
+
+    That no caller sees a half-recovered state rests on two things: uvicorn
+    completing lifespan startup before it accepts a connection, and recover()
+    finishing before the yield. The first is a dependency's behaviour -- true,
+    documented, and not ours to enforce. The second is ours, so it is what gets
+    asserted.
+
+    The sweep task matters just as much as the yield: started first, it would
+    run its watchdog against a registry that was still being built, and a job
+    half-recovered has no defensible deadline.
+    """
+    lifespan = _functions(_parse("api.py"))["lifespan"]
+
+    order = []
+    for node in ast.walk(lifespan):
+        if isinstance(node, ast.Call):
+            name = ast.unparse(node.func)
+            if name in ("jobs.init", "jobs.recover", "asyncio.create_task"):
+                order.append((node.lineno, name))
+        elif isinstance(node, ast.Yield):
+            order.append((node.lineno, "yield"))
+
+    sequence = [name for _line, name in sorted(order)]
+
+    assert sequence.index("jobs.init") < sequence.index("jobs.recover")
+    assert sequence.index("jobs.recover") < sequence.index("asyncio.create_task")
+    assert sequence.index("jobs.recover") < sequence.index("yield")
+
+
+def test_the_temp_sweep_is_start_up_only():
+    """FR-026's sweep must never join the periodic one.
+
+    Running it periodically would reintroduce exactly the race its age guard
+    exists to close: a CLI download can begin at any moment while the service is
+    up, and the guard only bounds how long one has to survive, not whether one
+    can start.
+    """
+    loop = _functions(_parse("api.py"))["_sweep_loop"]
+    called_in_loop = {
+        ast.unparse(node.func) for node in ast.walk(loop) if isinstance(node, ast.Call)
+    }
+    assert "jobs.sweep_abandoned_temp_dirs" not in called_in_loop
+
+    service_sweep = _functions(_parse("jobs.py"))["sweep"]
+    called_in_sweep = {
+        ast.unparse(node.func)
+        for node in ast.walk(service_sweep)
+        if isinstance(node, ast.Call)
+    }
+    assert "sweep_abandoned_temp_dirs" not in called_in_sweep
 
 
 def test_frozen_modules_are_not_imported_for_writing():

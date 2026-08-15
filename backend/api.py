@@ -62,8 +62,33 @@ async def _sweep_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Resolve configuration and build the pool before the first request lands."""
+    """Resolve configuration, adopt the last process's state, then serve.
+
+    The order is the requirement, not a preference:
+
+    1. init() -- configuration and the state directory must exist first;
+    2. recover() -- BEFORE the sweep task, which would otherwise run against a
+       half-built registry, and before yield, so nothing can be served from a
+       half-recovered state;
+    3. the temp-directory sweep, start-up only (FR-026);
+    4. the periodic sweep;
+    5. yield -- uvicorn accepts connections only after this point.
+
+    Step 5 is what makes step 2's guarantee complete, and it belongs to uvicorn
+    rather than to us. What we own is the order above, and tests/test_jobs.py
+    asserts it structurally for that reason.
+
+    recover() is synchronous and does filesystem work, and is called directly
+    rather than through to_thread -- unlike the periodic sweep. Blocking is the
+    point here: there is nothing else for the loop to serve yet, and start-up
+    must not proceed without it.
+    """
     jobs.init()
+
+    recovered = jobs.recover()
+    swept = jobs.sweep_abandoned_temp_dirs()
+    _log.info("start-up: adopted %d job record(s), removed %d leftover(s)", recovered, swept)
+
     sweeper = asyncio.create_task(_sweep_loop())
     try:
         yield
