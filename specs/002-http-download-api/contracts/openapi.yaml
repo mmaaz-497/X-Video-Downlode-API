@@ -58,11 +58,18 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
               example: { code: invalid_request, message: "The request body was not understood." }
         '429':
-          description: Rate limit exceeded (FR-019).
+          description: |
+            Rate limit exceeded for the calling address (FR-019).
+
+            Counted per *submission*, not per job created: an invalid URL and a deduplicated
+            submission both consume allowance. The address comes from the connection and never
+            from a header — see research.md D9 for which proxy configurations change that.
           headers:
             Retry-After:
               schema: { type: integer }
-              description: Seconds until the caller may submit again.
+              description: |
+                Seconds until the caller may submit again. Computed from the service's own
+                clock and window, so it discloses nothing about the request or the server.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -70,13 +77,31 @@ paths:
                 code: rate_limited
                 message: "Too many submissions. Try again in 240 seconds."
         '503':
-          description: Free disk is below the configured threshold; no job created (FR-018).
+          description: |
+            Two distinct refusals share this status, both meaning "not now, and no job was
+            created":
+
+            * `insufficient_storage` — free disk on the output volume is below the configured
+              threshold (FR-018);
+            * `at_capacity` — the pending queue is at `XVD_MAX_PENDING` (FR-015 as amended).
+
+            Neither message names the volume, the threshold, the queue depth, or how many jobs
+            are pending. Those are facts about the server (FR-029).
+
+            A deduplicated submission is never refused by either: it creates no job and consumes
+            no disk, so the caller receives the existing job's handle even at capacity.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-              example:
-                code: insufficient_storage
-                message: "The service is temporarily out of space. Try again later."
+              examples:
+                insufficientStorage:
+                  value:
+                    code: insufficient_storage
+                    message: "The service is temporarily out of space. Try again later."
+                atCapacity:
+                  value:
+                    code: at_capacity
+                    message: "The service is at capacity. Try again shortly."
 
   /jobs/{handle}:
     get:

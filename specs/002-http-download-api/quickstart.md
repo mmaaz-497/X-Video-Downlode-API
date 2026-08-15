@@ -78,7 +78,11 @@ done
 Confirm with `tcpdump`/Wireshark or by pulling the network cable: a rejected URL must generate no
 outbound traffic at all. Confirm no job file appeared under `.xvd-state/jobs/`.
 
-## Concurrency and the queue (US4, later phase)
+## Resource protection (US4)
+
+Each check below needs its own start-up, because every limit is read once at start-up.
+
+### Concurrency and the queue
 
 ```bash
 XVD_MAX_CONCURRENT=2 uv run uvicorn backend.api:app &
@@ -89,6 +93,67 @@ watch -n1 'curl -s localhost:8000/health'
 
 Submitting the **same** URL five times concurrently must yield one download and five identical
 handles (SC-007).
+
+### The pending cap, and what it must NOT break
+
+```bash
+XVD_MAX_CONCURRENT=1 XVD_MAX_PENDING=1 uv run uvicorn backend.api:app &
+# four DISTINCT post URLs:
+# 1 → 202 running
+# 2 → 202 waiting        ← FR-015's original promise, which the cap must preserve
+# 3 → 503 {"code":"at_capacity",…}
+# 4 → 503 at_capacity
+```
+
+The second submission **waiting** matters as much as the third being refused. A cap that made
+ordinary over-limit submissions fail would have reversed the requirement it was added to bound.
+
+Then, still at capacity, submit a URL for the job that is already running: it must come back
+**202 with the existing handle**. A dedup hit creates nothing, so the cap does not apply to it.
+
+### The rate limit
+
+```bash
+XVD_RATE_LIMIT=2 XVD_RATE_WINDOW=120 uv run uvicorn backend.api:app &
+for i in 1 2 3; do
+  curl -s -D- -X POST localhost:8000/jobs -H 'content-type: application/json' \
+    -d "{\"url\":\"https://x.com/a/status/$i\"}" | grep -iE '^(HTTP|retry-after)|code'
+done
+# → 202, 202, then:
+#   HTTP/1.1 429 Too Many Requests
+#   retry-after: 119
+#   {"code":"rate_limited","message":"Too many submissions. Try again in 119 seconds."}
+```
+
+Check the counting rule too: with `XVD_RATE_LIMIT=2`, **two invalid URLs must exhaust the
+allowance**, so a third submission of a perfectly valid URL is refused. That is deliberate —
+see tasks.md Phase 3 decision 2 — and if it is unwanted it is a one-line change, not a bug.
+
+### The free-disk floor
+
+```bash
+XVD_MIN_FREE_BYTES=99999999999999 uv run uvicorn backend.api:app &
+curl -s -X POST localhost:8000/jobs -H 'content-type: application/json' \
+  -d '{"url":"https://x.com/someone/status/123"}'
+# → 503 {"code":"insufficient_storage","message":"The service is temporarily out of space…"}
+ls "$XVD_STATE_DIR/jobs/"   # → empty. The check runs BEFORE a job exists (FR-018).
+```
+
+### The job time limit and the wedged-worker count
+
+```bash
+XVD_JOB_TIMEOUT=5 XVD_SWEEP_INTERVAL=5 uv run uvicorn backend.api:app &
+# submit a real post URL, then poll:
+curl -s localhost:8000/jobs/<handle>
+# → {"state":"failed","failure":{"code":"time_limit",…}}
+ls -a "$XVD_OUTPUT_DIR" | grep tmp-xvd   # → nothing; the frozen module's finally cleaned up
+curl -s localhost:8000/health
+# → wedged_workers is 0 if the worker returned, 1 if it is stuck in the ffmpeg merge
+```
+
+`wedged_workers` above zero means capacity has been permanently reduced until a restart. That is
+the accepted limitation in ADR-0002, not a bug to chase — but it must be **visible**, which is why
+the count exists. The operator log line to grep for is `xvd-wedged-worker`.
 
 ## Restart recovery (US6, later phase)
 

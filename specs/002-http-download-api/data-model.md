@@ -27,6 +27,7 @@ existing one.
 | `files` | `tuple[Path, ...]` | completion | From `DownloadOutcome.paths`. Server-side only; a caller sees only the count. |
 | `failure_code` | `str \| None` | terminal transition | A member of `FailureCode`. **The only failure information the record holds** (D6). |
 | `client_address` | `str` | creation | For the audit record (FR-031). |
+| `timed_out` | `bool` | progress callback | Set immediately before the callback raises, and read by the worker to tell a deadline abort from any other failure (FR-020, D4). **Not persisted** — `failure_code` already carries the outcome to disk. A boolean holds no free text, so it does not weaken the guarantee below; it is listed here because that guarantee is audited from this table. |
 
 ### Fields that deliberately do not exist
 
@@ -99,11 +100,16 @@ Append-only operator audit trail (FR-031), one JSON object per line at
 | `at` | ISO-8601 string | |
 | `canonical_url` | `str` | Post-validation only. The raw submitted string is never written (FR-032). |
 | `client_address` | `str` | |
-| `outcome` | `str` | `accepted` \| `deduplicated` \| `rejected_url` \| `rate_limited` \| `disk_low` |
+| `outcome` | `str` | `accepted` \| `deduplicated` \| `rejected_url` \| `rate_limited` \| `disk_low` \| `at_capacity` |
 | `handle` | `str \| None` | Present when a job was created or matched. |
 
 Written for **every** submission including refusals — a refusal is the more interesting record when
 investigating abuse. Contains no caller free text.
+
+**`canonical_url` is `null` for `rejected_url` and `rate_limited`, and present for the rest.** Not an
+inconsistency: both of those refusals are decided at or before validation, so at that moment the URL
+is still unvalidated caller-supplied text and FR-032 forbids storing it. `disk_low` and `at_capacity`
+are decided after validation has produced a canonical form.
 
 > **Note**: the handle in this log is the capability, so read access to the log confers access to the
 > jobs it names. Acceptable — the log is operator-only and the operator can read the video files

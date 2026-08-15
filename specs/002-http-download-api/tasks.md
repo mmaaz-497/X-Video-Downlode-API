@@ -611,7 +611,7 @@ no HTTP client, no network, and **no elapsed real time**.
 
 All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P]`.
 
-- [ ] **T029** [US4] Add the Phase-3 configuration to `backend/jobs.py`.
+- [X] **T029** [US4] Add the Phase-3 configuration to `backend/jobs.py`.
   - Six variables from the [data-model.md](./data-model.md) table, each with its documented default:
     `XVD_MAX_PENDING` (50), `XVD_JOB_TIMEOUT` (1800), `XVD_MIN_FREE_BYTES` (2147483648),
     `XVD_RATE_LIMIT` (10), `XVD_RATE_WINDOW` (3600), `XVD_SWEEP_INTERVAL` (900).
@@ -623,7 +623,7 @@ All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P
     mistake worth naming at start-up rather than serving.
   - Read in `init()`, alongside the existing two, and hold at module level.
 
-- [ ] **T030** [US4] Change `submit()` to return a result object instead of raising, in
+- [X] **T030** [US4] Change `submit()` to return a result object instead of raising, in
   `backend/jobs.py`, and update every call site.
   - **This is the one place Phase 3 changes an already-shipped signature, so it is its own task
     rather than a bullet inside another.** Three new refusals (rate limit, disk, capacity) have to
@@ -644,7 +644,7 @@ All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P
   - **Verify**: `uv run pytest` is green before any guard is added. This task changes shape, not
     behaviour, and proving that separately is the whole reason it is sequenced first.
 
-- [ ] **T031** [US4] Implement the per-address rate limit in `backend/jobs.py` (FR-019).
+- [X] **T031** [US4] Implement the per-address rate limit in `backend/jobs.py` (FR-019).
   - `dict[str, deque[float]]`, address → submission timestamps in the window (research D9,
     data-model.md `RateLimitBucket`).
   - `submit(..., now: Callable[[], float] = time.time)` per decision 4. Evict timestamps older than
@@ -658,7 +658,7 @@ All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P
   - Guard the bucket dict with its own lock, not `_lock`. A submission must not queue behind a
     registry scan to learn it is being refused.
 
-- [ ] **T032** [US4] Implement the free-disk guard in `backend/jobs.py` (FR-018).
+- [X] **T032** [US4] Implement the free-disk guard in `backend/jobs.py` (FR-018).
   - `shutil.disk_usage(_output_dir).free` compared against `XVD_MIN_FREE_BYTES`, **taken outside
     `_lock` and applied inside it, and only on the create path** (decision 1).
   - Skip the check entirely when the threshold is `0`.
@@ -671,7 +671,7 @@ All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P
     running (spec.md:222-224). That is a `failed` job, not a crash, and it is already handled by
     `_run_job`'s existing `BaseException` arm. Do not add a second mechanism here.
 
-- [ ] **T033** [US4] Implement the pending-depth cap in `backend/jobs.py` (FR-015 as amended).
+- [X] **T033** [US4] Implement the pending-depth cap in `backend/jobs.py` (FR-015 as amended).
   - Count jobs in `WAITING` in the same `_registry` pass as the dedup scan (decision 1). At or above
     `XVD_MAX_PENDING`, return `SubmitResult(None, "at_capacity", None)`.
   - The default of 50 against a concurrency limit of 2 is deliberate and the amended FR-015 says so:
@@ -682,7 +682,7 @@ All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P
     many addresses (spec.md:297-302). Say that at the code, since the cap looks redundant beside the
     rate limit until you have read why it is not.
 
-- [ ] **T034** [US4] Extend the audit trail with the three new outcomes in `backend/jobs.py`.
+- [X] **T034** [US4] Extend the audit trail with the three new outcomes in `backend/jobs.py`.
   - Add `RATE_LIMITED`, `DISK_LOW`, and `AT_CAPACITY` alongside the existing constants
     (`backend/jobs.py:350-352`), completing the `outcome` enum in
     [data-model.md](./data-model.md)'s `SubmissionRecord`.
@@ -695,7 +695,7 @@ All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P
   - A run of `rate_limited` lines from one address is the single most useful pattern the log can
     show, which is the reason FR-031 asks for refusals at all.
 
-- [ ] **T035** [US4] Enforce the job deadline from the progress callback in `backend/jobs.py`
+- [X] **T035** [US4] Enforce the job deadline from the progress callback in `backend/jobs.py`
   (FR-020, research D4).
   - Add a `timed_out: bool = False` field to `Job` **and add the row to
     [data-model.md](./data-model.md)'s table in the same task.** The `Job` docstring
@@ -720,7 +720,7 @@ All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P
     temp directory. **No cleanup code is needed here**; adding some would duplicate a frozen module's
     guarantee.
 
-- [ ] **T036** [US4] Implement `sweep()` in `backend/jobs.py` — the watchdog and the bucket prune.
+- [X] **T036** [US4] Implement `sweep()` in `backend/jobs.py` — the watchdog and the bucket prune.
   - A plain synchronous function taking `*, now: Callable[[], float] = time.time`. **It must not
     import or mention `asyncio`** — `tests/test_jobs.py:556-566` walks this module's imports and
     fails on it. The periodic caller lives in `api.py` (T039); this is the work, not the schedule.
@@ -739,7 +739,7 @@ All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P
     a worker that returns after the watchdog ruled cannot overwrite the verdict. **That guard was
     built in T003 for exactly this race** — it stops being hypothetical in this task.
 
-- [ ] **T037** [US4] Extend `tests/test_jobs.py` for every Phase-3 behaviour. **No `time.sleep`
+- [X] **T037** [US4] Extend `tests/test_jobs.py` for every Phase-3 behaviour. **No `time.sleep`
   anywhere.**
   - Rate limit: the Nth submission inside the window is refused; `retry_after` is a positive integer;
     a submission after `now` advances past the window is accepted again; a second address is
@@ -769,7 +769,7 @@ runs in the time it did before. `backend/api.py` is unchanged.
 
 **Goal**: the refusals over HTTP, and the schedule that drives the sweep.
 
-- [ ] **T038** [US4] Map the new refusals to status codes in `backend/api.py`.
+- [X] **T038** [US4] Map the new refusals to status codes in `backend/api.py`.
   - `rate_limited` → **429** with a **`Retry-After` header** carrying the integer seconds from
     `SubmitResult.retry_after`, and the body from
     [contracts/openapi.yaml](./contracts/openapi.yaml):60-71. The header is required by FR-019 —
@@ -783,7 +783,7 @@ runs in the time it did before. `backend/api.py` is unchanged.
     count already interpolated at `backend/api.py:328-332`, and is the sole exception for the same
     reason.
 
-- [ ] **T039** [US4] Run `jobs.sweep()` periodically from `backend/api.py`'s lifespan (research D7).
+- [X] **T039** [US4] Run `jobs.sweep()` periodically from `backend/api.py`'s lifespan (research D7).
   - `_sweep_loop`: `while True: await asyncio.sleep(XVD_SWEEP_INTERVAL)` then
     `await asyncio.to_thread(jobs.sweep)`. **`to_thread` is not optional** — `sweep` does filesystem
     work in T045 and must never run on the event loop.
@@ -797,7 +797,7 @@ runs in the time it did before. `backend/api.py` is unchanged.
     itself references no job data. Update the test's docstring to record why the exemption exists —
     the next reader must find the reason at the assertion, not in this file.
 
-- [ ] **T040** [US4] Add `GET /health` to `backend/api.py`
+- [X] **T040** [US4] Add `GET /health` to `backend/api.py`
   (contract at [contracts/openapi.yaml](./contracts/openapi.yaml):170-190).
   - Body: `status` (`ok` | `degraded`), `running`, `waiting`, `wedged_workers`. `degraded` when
     `wedged_workers > 0`.
@@ -810,7 +810,7 @@ runs in the time it did before. `backend/api.py` is unchanged.
     an operator can tell "the service is slow" from "the service has lost half its capacity and needs
     a restart".
 
-- [ ] **T041** [P] [US4] Correct the stale proxy-header docstring in `backend/api.py:358-364`.
+- [X] **T041** [P] [US4] Correct the stale proxy-header docstring in `backend/api.py:358-364`.
   - It still says "without those flags every caller collapses into the proxy's single address",
     which the T023 correction disproved: `proxy_headers` defaults to **`True`** and
     `forwarded_allow_ips` to **`"127.0.0.1"`** (`uvicorn/config.py:355-357`). research.md D9,
@@ -822,7 +822,7 @@ runs in the time it did before. `backend/api.py` is unchanged.
     are believed is a docstring that gets the rate limit bypassed. A directly exposed service must
     pass `--no-proxy-headers`, and nothing in the code currently says so.
 
-- [ ] **T042** [P] [US4] Update the contract and the operator-facing documents.
+- [X] **T042** [P] [US4] Update the contract and the operator-facing documents.
   - [contracts/openapi.yaml](./contracts/openapi.yaml): the `/jobs` `503` currently documents only
     `insufficient_storage`. Add the `at_capacity` example — FR-015's amendment introduced a second
     503 and the contract never caught up.

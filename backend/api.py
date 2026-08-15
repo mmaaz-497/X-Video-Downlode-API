@@ -18,6 +18,7 @@ Two rules this module exists to keep, both from ADR-0003:
 Pydantic appears in this file and nowhere else in the package (research D11).
 """
 
+import asyncio
 import datetime
 import logging
 from contextlib import asynccontextmanager
@@ -33,15 +34,52 @@ from backend import jobs
 _log = logging.getLogger("xvd.api")
 
 
+async def _sweep_loop() -> None:
+    """Call jobs.sweep() on a fixed interval, forever.
+
+    THE ONLY LOOP PERMITTED IN THIS FILE, and tests/test_jobs.py enforces that
+    by name. Every other function here must stay loop-free, because a loop in a
+    handler is iteration over domain data and that is logic, which belongs one
+    layer down. This one iterates over time rather than over anything the
+    service knows about, and it touches no job.
+
+    `to_thread` is not optional: sweep() does filesystem work, and running it on
+    the event loop would block every in-flight request behind a directory walk
+    (research D7).
+
+    A sweep that raises must not kill the loop. Retention stopping forever while
+    the service still answers every request is the worst failure available here
+    and the hardest to notice, so the exception is logged and the next interval
+    is waited out as normal.
+    """
+    while True:
+        await asyncio.sleep(jobs.sweep_interval())
+        try:
+            await asyncio.to_thread(jobs.sweep)
+        except Exception:
+            _log.exception("sweep failed; the next one will run as scheduled")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Resolve configuration and build the pool before the first request lands."""
     jobs.init()
-    yield
-    # wait=False: a download runs for minutes and blocking shutdown on one would
-    # hang every deploy. Jobs abandoned this way are recovered as interrupted on
-    # the next start-up, which is a later phase.
-    jobs.shutdown()
+    sweeper = asyncio.create_task(_sweep_loop())
+    try:
+        yield
+    finally:
+        # Cancelled and awaited, or the loop outlives the executor it depends
+        # on and the next sweep runs against a shut-down service.
+        sweeper.cancel()
+        try:
+            await sweeper
+        except asyncio.CancelledError:
+            pass
+
+        # wait=False: a download runs for minutes and blocking shutdown on one
+        # would hang every deploy. Jobs abandoned this way are recovered as
+        # interrupted on the next start-up, which is a later phase.
+        jobs.shutdown()
 
 
 # debug=False so no traceback middleware is installed. A stack trace rendered
@@ -142,6 +180,38 @@ def _refused(result: jobs.SubmitResult) -> JSONResponse:
     """
     if result.problem == jobs.INVALID_URL:
         return _error(400, "invalid_url", "That is not a valid X post URL.")
+
+    if result.problem == jobs.RATE_LIMITED:
+        # Retry-After is required by FR-019 -- "a refusal MUST state when the
+        # caller may retry" -- and a header a client already knows how to obey
+        # beats a sentence only a human reads. The seconds figure is computed
+        # from the service's own clock and window, so interpolating it carries
+        # nothing about the request or the server's filesystem.
+        seconds = result.retry_after or 1
+        response = _error(
+            429,
+            "rate_limited",
+            f"Too many submissions. Try again in {seconds} seconds.",
+        )
+        response.headers["Retry-After"] = str(seconds)
+        return response
+
+    if result.problem == jobs.DISK_LOW:
+        # Says nothing about the volume, the threshold, or how much is left.
+        # Those are facts about the server, and FR-029 admits none of them.
+        return _error(
+            503,
+            "insufficient_storage",
+            "The service is temporarily out of space. Try again later.",
+        )
+
+    if result.problem == jobs.AT_CAPACITY:
+        # Likewise silent about the queue depth and how many jobs are pending.
+        return _error(
+            503,
+            "at_capacity",
+            "The service is at capacity. Try again shortly.",
+        )
 
     # A problem this table does not know is a bug in the layer below, not a
     # caller error. It gets the generic body rather than its own code leaking
@@ -270,7 +340,11 @@ async def _unhandled_handler(_request: Request, exc: Exception) -> JSONResponse:
     "/jobs",
     status_code=202,
     response_model=JobResponse,
-    responses={400: {"model": Error}},
+    responses={
+        400: {"model": Error},
+        429: {"model": Error},
+        503: {"model": Error},
+    },
 )
 def submit_job(body: SubmitRequest, request: Request) -> JobResponse | JSONResponse:
     """Accept a URL and answer immediately with a handle (FR-001).
@@ -363,6 +437,36 @@ def _serve(handle: str, index: int | None) -> FileResponse | JSONResponse:
     return FileResponse(result.path, filename=result.path.name)
 
 
+class HealthResponse(BaseModel):
+    """Aggregate counts only. No handle, no URL, no address, no path.
+
+    This endpoint is unauthenticated and reachable by anyone who can reach the
+    port, so what it may carry is decided by that fact rather than by what would
+    be convenient for the operator.
+    """
+
+    status: str
+    running: int
+    waiting: int
+    wedged_workers: int
+
+
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    """Liveness and capacity.
+
+    `wedged_workers` is the visible face of the limitation ADR-0002 accepts: a
+    download whose ffmpeg merge hung holds a worker thread until restart. It is
+    exposed because it is the difference between "the service is slow" and "the
+    service has permanently lost half its capacity and needs restarting", and an
+    operator cannot tell those apart from response times.
+
+    The counting happens in jobs.health(); walking the registry here would be
+    domain iteration in a request handler.
+    """
+    return HealthResponse(**jobs.health())
+
+
 def _caller(request: Request) -> str:
     """The calling address, for the audit record (FR-031) and the later rate limit.
 
@@ -372,13 +476,15 @@ def _caller(request: Request) -> str:
     own identity, which defeats a per-address rate limit completely and fills
     the audit log with whatever an abuser felt like typing.
 
-    Running behind a reverse proxy is handled one layer out, not here: uvicorn's
-    --proxy-headers rewrites request.client from X-Forwarded-For, but only for
-    connections from the addresses named in --forwarded-allow-ips. That keeps
-    the trust decision in the operator's start-up command, where it belongs,
-    instead of in a header this code would have no way to judge. See
-    .env.example and quickstart.md; without those flags every caller collapses
-    into the proxy's single address.
+    Whether a proxy header may be believed is settled one layer out, in
+    uvicorn's start-up flags, because only the operator knows what sits in front
+    of the port. Note that uvicorn believes X-Forwarded-For BY DEFAULT from
+    127.0.0.1 (proxy_headers=True, forwarded_allow_ips="127.0.0.1"), so the
+    dangerous configuration is the one with no flags at all: a directly exposed
+    service must be started with --no-proxy-headers, or anything that can reach
+    the port from localhost can choose its own address and escape the rate limit
+    this value feeds. research.md D9 carries the full three-case table; it is
+    not restated here, because it has already been wrong in four places at once.
 
     request.client is None for transports that have no peer address, so the
     fallback keeps the audit line well-formed rather than crashing a submission

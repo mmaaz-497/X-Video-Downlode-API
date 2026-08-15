@@ -1007,15 +1007,74 @@ def test_transport_layer_does_not_reach_past_the_service_layer():
     assert "open" not in _called_names(_parse("api.py"))
 
 
-def test_transport_layer_has_no_loops():
+# The one function in api.py allowed to contain a loop. Named, not a relaxed
+# rule: the periodic sweep iterates over TIME, which is a transport-lifecycle
+# concern, while every other loop in a request handler would be iteration over
+# domain data. Adding a second name here should require the same argument this
+# one got -- see tasks.md, Phase 3 decision 3.
+_LOOP_EXEMPT = frozenset({"_sweep_loop"})
+
+
+def _functions(tree: ast.Module) -> dict[str, ast.AST]:
+    return {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def test_transport_layer_has_no_loops_outside_the_sweep():
     """A loop in a handler is iteration over domain data, which is logic.
 
-    Cheap and blunt on purpose: if formatting a response ever genuinely needs a
-    loop, that is worth a second look rather than a silent allowance.
+    This assertion fired for the first time when the retention sweep needed
+    `while True: await asyncio.sleep(...)` in the lifespan. Its old docstring
+    said a genuine need was "worth a second look rather than a silent
+    allowance" -- this is that second look, and the answer was to name the one
+    exception rather than to weaken the check. Deleting it would give up the
+    thing that keeps request handlers from growing logic.
     """
     tree = _parse("api.py")
-    loops = [node for node in ast.walk(tree) if isinstance(node, (ast.For, ast.While))]
-    assert not loops, f"backend/api.py contains {len(loops)} loop(s)"
+    offenders = {
+        name: sum(
+            1 for node in ast.walk(func) if isinstance(node, (ast.For, ast.While))
+        )
+        for name, func in _functions(tree).items()
+        if name not in _LOOP_EXEMPT
+    }
+    assert not {n: c for n, c in offenders.items() if c}, f"loops found in {offenders}"
+
+
+def test_the_exempt_loop_iterates_over_time_and_not_over_jobs():
+    """The exemption is only sound while the loop stays a schedule.
+
+    If `_sweep_loop` ever walks the registry or touches a job, it has become the
+    logic the rule exists to keep out of this file, and the exemption stops
+    being justified.
+    """
+    loop = _functions(_parse("api.py"))["_sweep_loop"]
+
+    # Identifiers, NOT a text dump of the tree. Dumping would include the
+    # docstring, and a docstring that explains "this must not touch a job" would
+    # fail the check for saying so -- which is precisely the T006 mistake this
+    # whole section exists to avoid making again. It was made here first, and
+    # caught by the test failing on its own prose.
+    referenced = {
+        node.id if isinstance(node, ast.Name) else node.attr
+        for node in ast.walk(loop)
+        if isinstance(node, (ast.Name, ast.Attribute))
+    }
+
+    for forbidden in ("_registry", "Job", "file_for", "get", "submit", "handle"):
+        assert forbidden not in referenced, f"_sweep_loop references {forbidden}"
+
+    # What it IS allowed to do: sleep, and hand the work to a thread.
+    called = {
+        ast.unparse(node.func)
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Call)
+    }
+    assert "asyncio.to_thread" in called
+    assert "asyncio.sleep" in called
 
 
 def test_frozen_modules_are_not_imported_for_writing():
