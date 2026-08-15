@@ -15,15 +15,16 @@ description: "Task list for 002-http-download-api — Phase 1 (US1 + US3), Phase
 | Plan phase | Stories | Tasks | State |
 |---|---|---|---|
 | Phase 1 | US1 + US3 | T001–T028 | **complete** — T027 verified by the owner 2026-08-15 |
-| Phase 2 | US2 | — | not generated |
+| **Phase 2** | **US2** | **T061–T067** | **generated below** |
 | Phase 3 | US4 | T029–T043 | **complete** — T043 verified by the owner 2026-08-15 |
 | Phase 4 | US5 | T044–T050 | **complete** — T049 verified 2026-08-15; T050 close-out open |
 | Phase 5 | US6 | T051–T060 | **complete** — T059 verified 2026-08-15; T060 close-out open |
 
-**Every 🚦 manual verification has passed** (T027, T043, T049, T059 — all 2026-08-15). The two
-close-out tasks, T050 and T060, are the only open items, and US2 is the only story never built.
+**Every 🚦 manual verification generated so far has passed** (T027, T043, T049, T059 — all
+2026-08-15). Open: the two close-out tasks T050 and T060, and all of Phase 2 (T061–T067).
 
-US2 and US6 are deliberately absent, by instruction. See *Explicitly Not In This Document*.
+Every phase in the plan now has tasks. The deferral register below records what was excluded and
+when it was picked up.
 
 **Tests**: Per Constitution Principle II, exactly one test file, `tests/test_jobs.py` — extended, never
 joined by a second. No HTTP integration tests, no network calls, no mocking framework. Manual
@@ -437,7 +438,7 @@ Named so that their absence reads as a decision rather than an oversight:
 
 | Deferred | Requirements | Belongs to | Status |
 |---|---|---|---|
-| Full per-code message refinement | FR-010, FR-011 | US2 / plan Phase 2 | not generated |
+| Full per-code message refinement | FR-010, FR-011 | US2 / plan Phase 2 | **now T061–T067** |
 | Disk guard, rate limit, `XVD_MAX_PENDING`, job time limit + watchdog | FR-018, FR-019, FR-020, FR-015 cap | US4 / plan Phase 3 | **built, T029–T042** |
 | Retention sweep, `expired` transition | FR-021, FR-022, FR-023 | US5 / plan Phase 4 | **built, T044–T048** |
 | Restart recovery, temp-directory sweep | FR-024 (read side), FR-025, FR-026 | US6 / plan Phase 5 | **now T051–T060** |
@@ -1388,9 +1389,13 @@ intermediate state where half of recovery is shipped.
 After T056 (the service layer, complete and tested) and after T058. T059 is the owner's, and T060 is
 the close-out commit.
 
-### Found during T057 — now fixed (T061)
+### Found during T057 — now fixed
 
-> **Resolved 2026-08-15.** `jobs.configure_logging()` gives the `xvd` namespace a handler, a level
+> **Resolved 2026-08-15**, as a direct fix rather than a numbered task: it repaired an
+> already-shipped requirement (US3's FR-033) rather than delivering new scope, so giving it a task ID
+> in a phase that had already closed would have misfiled it.
+>
+> `jobs.configure_logging()` gives the `xvd` namespace a handler, a level
 > from `XVD_LOG_LEVEL` defaulting to INFO, and a format carrying a timestamp and the logger name. It
 > is the first call in the lifespan, before `init()`, so start-up's own report is emitted. Verified
 > live: the correlation line now appears as
@@ -1432,4 +1437,225 @@ INFO, and a format carrying a timestamp and the logger name.
 
 **US2 only** — per-code message refinement (FR-010, FR-011). Worth stating plainly: the *mechanism*
 shipped in Phase 1 and the drift test in T014 pins it, so what US2 would add is better sentences, not
-new capability. The feature is functionally complete at T060.
+new capability. The feature is functionally complete at T060. **Tasks generated below: T061–T067.**
+
+---
+---
+
+# Plan Phase 2 (US2) — per-code failure message refinement
+
+**Generated 2026-08-15.** Tasks **T061–T067**. The last unbuilt phase, and the smallest.
+
+Everything mechanical is already in place: `FAILURE_PREFIXES` classifies (T013), `FAILURE_MESSAGES`
+carries the sentences (T012), and T014's drift test pins both against `downloader._ERROR_DIAGNOSES`.
+**This phase changes the *values* in one dict and nothing else.**
+
+---
+
+## The one rule that shapes every task
+
+**US2 changes values, never keys.** Adding, removing, or renaming a code would move
+`FAILURE_PREFIXES`, `_classify`, and T014's three coverage assertions — that is plumbing, and the
+plumbing shipped. If a task below appears to need a new code, **stop and report**: it means a
+distinction was found that the classifier cannot actually make, which is a research question, not a
+wording one.
+
+Concretely, all of this must remain true and unedited:
+
+- `test_every_upstream_diagnosis_is_classified` — every explanation maps to exactly one code
+- `test_upstream_diagnoses_do_not_all_collapse_to_one_code` — at least four distinct codes
+- `test_every_code_has_a_caller_safe_message` — keys of both dicts agree
+- `test_no_caller_message_can_leak_a_path` — no `/`, `\`, `..`, `yt-dlp`, or `ffmpeg` in any sentence
+
+That last one is why every new sentence has to be read against the *character set* as well as the
+meaning: a sentence saying "check the link and try again" is fine, one saying "check the URL path" is
+not.
+
+---
+
+## Decisions recorded before the breakdown
+
+### 1. The organising question is "can retrying ever help?"
+
+US2's story says it outright: a caller needs to tell *"this post will never work"* from *"something
+went wrong, try again"* (spec.md:66-68). That is the only decision a caller actually makes with this
+information, so it is the axis the review runs along. Every code sorts into exactly one of three:
+
+| Class | Codes | What the sentence must convey |
+|---|---|---|
+| **Permanent** — the post will never download | `no_video`, `not_a_video`, `protected_account`, `age_restricted`, `post_unavailable` | why, and implicitly that retrying is pointless |
+| **Transient** — retrying may work | `interrupted`, `time_limit` | that retrying is worth doing |
+| **Server-side** — not the caller's doing at all | `service_unavailable`, `unclassified` | that nothing about their link is wrong |
+
+A sentence that leaves a caller unable to place their failure in one of those three has failed at the
+only job it has, however grammatical it is.
+
+### 2. Two sentences are not unclear — they are wrong. That is what this phase is for.
+
+The review found two defects of fact, not of style, and they are the reason this phase is worth
+running rather than skipping:
+
+**`service_unavailable` claims something untrue.** It currently ends *"The operator has been
+notified."* **Nothing notifies the operator.** There is no alerting, no paging, no email — the
+condition is written to a log that a human may read eventually. Telling a caller they have been
+notified invites them to wait for a fix that nobody knows is needed. A caller-facing sentence that
+asserts a process the system does not perform is worse than a vague one.
+
+**`not_a_video` describes the wrong subject.** It reads *"This post contains media, but it is not a
+video."* But this code is reached only via yt-dlp's `Media #<n> is not a video`
+(`twitter.py:1359`), which fires **only when the caller named an explicit index** — a bare post URL
+can never produce it. The truthful statement is about *the item they asked for*, not about the post.
+As written it also implies the service inspected the post's contents and can characterise them, which
+is exactly what decision 3 says it cannot do.
+
+### 3. The FR-004 limitation stands, and it constrains wording directly
+
+Feature 001's research D6 records it: yt-dlp distinguishes "images but no video" from "no media at
+all" **only** when an explicit `/photo/<n>` or `/video/<n>` index is present. For a bare URL both
+collapse to `No video could be found in this tweet`, because the extractor filters on
+`m['type'] != 'photo'` (`twitter.py:1349`) and never reports what it filtered out
+(`specs/001-post-video-download/research.md:231-238`).
+
+**So no sentence for `no_video` may mention images.** "This post has images but no video" would be a
+claim the service cannot support — it is equally the sentence for a text-only post. The current
+wording, "This post does not contain a video", is already correct on this point and **must stay
+correct**; the risk in this phase is a well-meaning edit adding a detail that sounds more helpful and
+is not true.
+
+### 4. `service_unavailable` still never names `ffmpeg`
+
+Standing rule from T012, restated because this is the phase most likely to erode it. A missing
+`ffmpeg` is an operator misconfiguration; naming it to the public describes the server's installation
+and tells a caller something they can neither use nor act on. The replacement sentence must say *that*
+the service cannot work right now, never *why*. T014's path check enforces the token; nothing but
+review enforces the intent.
+
+---
+
+## Phase 16: US2 — the sentences (Priority: P2)
+
+**Goal**: nine sentences that a person who has never heard of this service can act on.
+
+**Independent Test**: read each sentence cold and answer "should I try again?" — the three-way
+classification in decision 1 is the pass criterion, and T064 encodes the parts of it a test can hold.
+
+- [ ] **T061** [US2] Audit the nine sentences in `backend/jobs.py` against decision 1. **No code
+  change in this task.**
+  - For each code, record: its class (permanent / transient / server-side), whether the current
+    sentence lets a caller work that class out, and whether it says anything the service cannot
+    support.
+  - Write the table into this file under the task, so the reasoning survives the edit. A wording
+    change with no record of what was wrong with the old wording invites it being changed back.
+  - **Verify the reachability of each code before rewriting its sentence.** `not_a_video` is the one
+    that matters: confirm from `FAILURE_PREFIXES` and `twitter.py:1359` that it requires an indexed
+    URL. A sentence written for a case that cannot occur is worse than no sentence.
+
+- [ ] **T062** [US2] Fix the two sentences that are **wrong** in `backend/jobs.py` (decision 2).
+  - `SERVICE_UNAVAILABLE`: remove the "The operator has been notified" claim. Replace with something
+    that places the fault on the service and tells the caller the link is not the problem — for
+    example *"The service cannot process downloads right now. This is a problem with the service, not
+    with your link. Try again later."* Still **no mention of `ffmpeg`** or of any cause (decision 4).
+  - `NOT_A_VIDEO`: re-aim the sentence at the item the caller named rather than at the post — for
+    example *"The media item you asked for is not a video."* **Do not interpolate the index**; the
+    sentence stays a literal, and the caller already knows which index they sent.
+  - Both are single-line dict edits. Nothing else in the module changes.
+
+- [ ] **T063** [US2] Give the transient and server-side codes an actionable ending in
+  `backend/jobs.py` (decision 1).
+  - `TIME_LIMIT` currently stops at *"The download took too long and was stopped."* — true, and it
+    leaves the caller with no idea whether to retry. It is **transient**: a stalled transfer often
+    succeeds on a second attempt. Say so, without promising it will.
+  - `UNCLASSIFIED` currently reads *"The download failed for an unexpected reason."* — it is
+    **server-side**, and the caller's most useful information is that they did nothing wrong and may
+    try again.
+  - `INTERRUPTED` already ends *"Submit it again to retry."* — **leave it alone.** It is the model
+    the other two are being brought up to, and re-wording it would be churn.
+  - The five **permanent** codes get no retry invitation, deliberately. Inviting a retry on a
+    protected-account post sends the caller round a loop that cannot terminate.
+  - Keep every sentence to one or two short sentences. These appear in a JSON field, often in a
+    terminal, sometimes on a phone.
+
+- [ ] **T064** [US2] Extend `tests/test_jobs.py` with the catalog properties a test can hold.
+  - **Every sentence is a literal**: parse `backend/jobs.py` with `ast` and assert every value in the
+    `FAILURE_MESSAGES` dict is an `ast.Constant` (or a `JoinedStr`-free concatenation of them) — never
+    an f-string, a `%`, a `.format`, or a name. **This is the structural half of FR-029** and is
+    currently guaranteed only by everyone having behaved; after this phase edits the table by hand it
+    should be guaranteed by a test.
+  - **No sentence claims the operator was notified** — assert against `"notified"`. That defect
+    shipped once and a test is cheaper than remembering.
+  - **No sentence mentions images**, so the FR-004 limitation cannot be violated by a future edit
+    (decision 3). Assert against `"image"` and `"photo"`.
+  - **The transient codes invite a retry and the permanent ones do not**: assert `interrupted`,
+    `time_limit`, and `unclassified` contain a retry cue, and that `protected_account`,
+    `age_restricted`, `no_video`, `not_a_video`, and `post_unavailable` do not. Encode the
+    classification as a frozenset in the test so decision 1 is machine-checked rather than remembered.
+  - **T014's four assertions must pass unchanged.** Do not edit them; if one goes red, a key moved and
+    the phase has exceeded its scope.
+
+- [ ] **T065** [US2] Update the documents that quote the sentences.
+  - [data-model.md](./data-model.md)'s `FailureCode` table carries all nine verbatim — bring it into
+    line, and add the class column from decision 1 so the table records *why* each sentence is shaped
+    as it is.
+  - [contracts/openapi.yaml](./contracts/openapi.yaml) uses `"This post does not contain a video."` as
+    a `409` example; update it if that sentence changed (it should not).
+  - Note in data-model.md that the codes themselves are frozen by T014 and that US2 changed values
+    only.
+
+---
+
+## Phase 17: Verification
+
+- [ ] **T066** 🚦 **STOP. Manual verification of US2 — the owner runs this.**
+  - Submit, against a running service, the three posts US2's Independent Test names: **a post with
+    images but no video**, **a protected-account post**, and **a deleted post**. Confirm each failed
+    job reports a **different** named code, and that the sentence for each reads correctly cold.
+  - Submit the same post twice and confirm the code is **identical** both times (SC-004).
+  - Submit an **indexed URL naming a photo** — e.g. `/video/2` on a post whose second item is an
+    image — to reach `not_a_video`, which no bare URL can produce. If it cannot be reached with a
+    real post, say so: a code that cannot be triggered in practice is worth knowing about.
+  - Read all nine sentences as a set and answer, for each, "should I try again?" That is decision 1's
+    criterion and the only test of this phase that a human has to perform.
+  - Record results inline in this file.
+
+- [ ] **T067** Close US2 and the feature out.
+  - `uv run pytest` green, T014 untouched; `git diff --stat 3a3918e HEAD` over the three frozen
+    modules prints nothing; no dependency change; `tests/` still holds three files.
+  - Update this document's scope table so Phase 2 reads complete, and record in `plan.md` that all
+    five phases are delivered.
+  - **This is the last task in the feature.**
+
+---
+
+## Dependencies & Execution Order (T061–T067)
+
+```text
+T061 (audit, no code change)
+  └─> T062 (fix what is wrong) ──> T063 (finish what is unhelpful)
+        └─> T064 (tests) ──> T065 (documents)
+              └─> T066  🚦 STOP ──> T067
+```
+
+**Hard sequencing rules**:
+
+- **T061 produces no diff, and that is deliberate.** Deciding what is wrong with a sentence while
+  editing it is how the two defects in decision 2 survived a phase that already reviewed this table.
+- **T062 before T063**: correctness before helpfulness. A wrong sentence made friendlier is still
+  wrong.
+- **T064 after both edits**, since it asserts properties of the finished table.
+- **T061–T063 all edit one dict** in `backend/jobs.py` and cannot be parallel.
+
+### Parallel Opportunities
+
+None worth marking. Three tasks edit one dict, two edit documents that depend on it.
+
+---
+
+## Implementation Strategy
+
+One sitting; the whole phase is a dict, a test, and two documents. The value is concentrated in T061
+and T062 — the audit and the two factual corrections — and the rest is finishing.
+
+### Suggested commit points
+
+After T063 (the table, corrected and complete) and after T065. T066 is the owner's; T067 closes the
+feature.
