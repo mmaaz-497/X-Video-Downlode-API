@@ -16,18 +16,18 @@ description: "Task list for 002-http-download-api — Phase 1 (US1 + US3), Phase
 |---|---|---|---|
 | Phase 1 | US1 + US3 | T001–T028 | **complete** — T027 verified by the owner 2026-08-15 |
 | Phase 2 | US2 | — | not generated |
-| Phase 3 | US4 | T029–T043 | code complete; **T043 awaits the owner** |
-| Phase 4 | US5 | T044–T050 | code complete; **T049 awaits the owner** |
-| Phase 5 | US6 | T051–T060 | code complete; **T059 awaits the owner** |
+| Phase 3 | US4 | T029–T043 | **complete** — T043 verified by the owner 2026-08-15 |
+| Phase 4 | US5 | T044–T050 | **complete** — T049 verified 2026-08-15; T050 close-out open |
+| Phase 5 | US6 | T051–T060 | **complete** — T059 verified 2026-08-15; T060 close-out open |
 
-All three outstanding tasks are the 🚦 manual verifications, which the owner runs. Nothing else is
-open.
+**Every 🚦 manual verification has passed** (T027, T043, T049, T059 — all 2026-08-15). The two
+close-out tasks, T050 and T060, are the only open items, and US2 is the only story never built.
 
 US2 and US6 are deliberately absent, by instruction. See *Explicitly Not In This Document*.
 
 **Tests**: Per Constitution Principle II, exactly one test file, `tests/test_jobs.py` — extended, never
 joined by a second. No HTTP integration tests, no network calls, no mocking framework. Manual
-verification via `curl` closes each phase (T027, T043, T049).
+verification via `curl` closes each phase (T027, T043, T049, T059) — all four passed 2026-08-15.
 
 ## Owner decisions recorded before this breakdown
 
@@ -403,11 +403,12 @@ the leakage grep is silent across every endpoint.
   | # | Check | Result |
   |---|---|---|
   | 1 | Submission returns a handle in under one second | **50 ms** — twenty times inside SC-001's budget |
-  | 2 | Status poll | `finished`, `file_count: 1` |
+  | 1b | Handle shape | **43 characters**, correct format (FR-027, 256 bits) |
+  | 2 | Status poll | `finished`, `file_count: 1`, `completed_at` set |
   | 3 | Retrieved file has picture **and** sound | `ffprobe` reports **both a video and an audio stream** |
-  | 4 | Non-X URL rejected in the submission response | rejected, `code: invalid_url` |
+  | 4 | Non-X URL rejected in the submission response | `https://example.com/video/1` → `code: invalid_url`, **no job record created** |
   | 5 | Unknown handle refused | `code: not_found` |
-  | 6 | *(extra)* Malformed doubled URL | rejected correctly |
+  | 6 | *(extra)* Malformed doubled URL | `https://x.com/https://x.com/user/status/id` → `invalid_url` |
 
   **On check 2**: the job read `finished` on the poll rather than showing progress advancing between
   two calls. That is the documented edge case, not a miss — spec.md:210-212 and :217-219 record that a
@@ -868,7 +869,7 @@ created; `/health` answers.
 
 ## Phase 10: US4 verification
 
-- [ ] **T043** 🚦 **STOP. Manual verification of US4 — the owner runs this.**
+- [X] **T043** 🚦 **STOP. Manual verification of US4 — the owner runs this.**
   *(Per instruction: a manual verification task per phase, and stop before it.)*
   - Ten simultaneous submissions against a concurrency limit of 2: **no more than two run at any
     instant and all ten reach a terminal state** (SC-006). Poll `/health` during, do not infer it.
@@ -883,6 +884,29 @@ created; `/health` answers.
   - Set `XVD_JOB_TIMEOUT` to a few seconds and submit a real download: the job reaches
     `failed`/`time_limit`, and the temp directory under the output directory is **gone**.
   - Record results inline in this file, as feature 001 did.
+
+  ### T043 results — run by the owner, 2026-08-15 ✅ PASS (all three guards)
+
+  | Guard | Configuration | Result |
+  |---|---|---|
+  | Pending cap | `XVD_MAX_CONCURRENT=1`, `XVD_MAX_PENDING=1` | 1 `running`, 2 **`waiting`**, 3 and 4 refused `at_capacity` |
+  | Rate limit | `XVD_RATE_LIMIT=2` | third submission → **429** with a `Retry-After` header |
+  | Disk guard | `XVD_MIN_FREE_BYTES` above free space | **503** `insufficient_storage`; job-record count in `.xvd-state/jobs/` **identical before and after** |
+  | `/health` | — | `status: ok`, `running: 0`, `waiting: 0`, `wedged_workers: 0` |
+
+  **Submission 2 being held rather than refused is the property that matters.** A cap that refused
+  ordinary over-limit submissions would have reversed the very requirement it was added to bound —
+  FR-015 promises "accepted and held in the waiting state", and the amendment only ever intended to
+  bound the far tail. The observed 1/2/3-4 split is that promise surviving its own amendment.
+
+  **The disk guard was verified by counting job records either side of the refusal**, not by reading
+  the response. FR-018 requires the check to happen *before a job is created*, and an unchanged count
+  is the only evidence that distinguishes "refused before" from "created then refused".
+
+  **Not separately exercised** (the guards above were the phase's point, and each is covered by tests
+  and by mutation): the ten-simultaneous-submissions SC-006 run, the five-concurrent-duplicates
+  SC-007 run, rate-limit recovery after the window elapses, and the `XVD_JOB_TIMEOUT` /
+  `time_limit` path with its temp-directory cleanup.
 
 ---
 
@@ -958,7 +982,7 @@ file is gone, the job reports `expired`, and `file_for` refuses.
     US5 sequence. **If `api.py` turns out to need a change after all, stop and report it** — it would
     mean T019's anticipation was wrong, which is worth knowing rather than patching over.
 
-- [ ] **T049** 🚦 **STOP. Manual verification of US5 — the owner runs this.**
+- [X] **T049** 🚦 **STOP. Manual verification of US5 — the owner runs this.**
   - Complete a real job, set `XVD_RETENTION=60` and `XVD_SWEEP_INTERVAL=10`, wait, and confirm: the
     file is gone from the output directory, `GET /jobs/{handle}` reports **`expired`** and not
     `failed`, and `GET /jobs/{handle}/file` returns **410** with the expired message.
@@ -969,6 +993,23 @@ file is gone, the job reports `expired`, and `file_for` refuses.
     successful retry on the following pass.
   - Confirm no finished file survives more than retention plus one sweep interval (SC-009).
   - Record results inline in this file.
+
+  ### T049 results — run by the owner, 2026-08-15 ✅ PASS
+
+  | Check | Configuration | Result |
+  |---|---|---|
+  | Finished job expires after its retention period | `XVD_RETENTION=60`, `XVD_SWEEP_INTERVAL=10` | transitioned to **`expired`** |
+  | File request against an expired job | — | **410**, distinct from `failed` |
+
+  **`expired` being distinct from `failed` is FR-022's whole point.** A caller who came back too late
+  has not suffered a failure and must not be told they did — the state and the status code both carry
+  that distinction, and both were observed.
+
+  **Not separately exercised**: a job finished seconds ago surviving the same sweep, the
+  mark-before-delete ordering observed mid-transfer, and SC-009's retention-plus-one-interval bound.
+  The first two are covered by tests and by mutation — reversing the mark/delete order and removing
+  the tolerance each turn a test red (see the T045/T046 notes) — so what remains unobserved by hand is
+  the timing bound rather than the behaviour.
 
 - [ ] **T050** Close both phases out.
   - **Verify**: `git diff --stat HEAD -- backend/downloader.py backend/validation.py backend/config.py`
@@ -1256,7 +1297,7 @@ what the last one was doing. `backend/api.py` is still unchanged by this phase.
   - Confirm the existing boundary tests still hold: `jobs.py` imports no framework, `api.py` has no
     loop outside `_sweep_loop`, and `_sweep_loop` still touches no job data.
 
-- [ ] **T059** 🚦 **STOP. Manual verification of US6 — the owner runs this.**
+- [X] **T059** 🚦 **STOP. Manual verification of US6 — the owner runs this.**
   - Start a real download, then **`kill -9`** the service mid-transfer — no graceful shutdown, or the
     thing being tested does not happen.
   - Restart. Then confirm:
@@ -1273,13 +1314,36 @@ what the last one was doing. `backend/api.py` is still unchanged by this phase.
     the one failure a single restart cannot reveal.
   - Record results inline in this file.
 
+  ### T059 results — run by the owner, 2026-08-15 ✅ PASS
+
+  | Check | Result |
+  |---|---|
+  | Killed mid-download, restarted | job reports a **terminal state with the interrupted reason** — never `running` (FR-025) |
+  | Leftover temp directory | **none survived** (FR-026) |
+  | **Second kill and restart, immediately after the first recovery** | job **stayed terminal** — did not revert to `running` |
+
+  **The second kill is the check that carries the phase.** A single restart proves only that recovery
+  ran once; it cannot distinguish a verdict that was written to disk from one that lived in memory and
+  died with the process. Restarting again straight afterwards is what proves the write-back inside
+  `recover()` did its job — without it the record would still have read `running`, and the job would
+  have been "recovered" as interrupted on every boot forever while never actually being so.
+
+  This matches the mutation result recorded against T053: removing that write-back turns three tests
+  red, one of which restarts twice. The manual run and the mutation are the same claim checked from
+  opposite directions — one shows the guarantee holding, the other shows it failing when removed.
+
+  **Not separately reported**: that a job which had *finished* before the kill still serves its file
+  after the restart, and that nothing resumed downloading on boot. Both were verified during T057
+  against a live boot over a staged crash state (a `finished` record served a 200 with the right
+  bytes; `test_recovery_does_not_requeue_anything` asserts the second against the executor).
+
 - [ ] **T060** Close the feature out.
   - **Verify**: `git diff --stat 3a3918e HEAD -- backend/downloader.py backend/validation.py backend/config.py`
     prints nothing. Standing instruction, same backstop as T024 and T050.
   - `uv run pytest` green; `git diff pyproject.toml uv.lock` empty; `tests/` still holds exactly three
     files.
   - Update this document's scope table: every phase generated is then code-complete, with only the
-    remaining 🚦 manual verifications (T043, T049, T059) outstanding — T027 passed 2026-08-15.
+    🚦 manual verifications passed (T027, T043, T049, T059 — all 2026-08-15).
   - Note in `plan.md` that Phase 5 is delivered and US2 is the only story never built.
 
 ---
