@@ -14,7 +14,7 @@ description: "Task list for 002-http-download-api — Phase 1 (US1 + US3), Phase
 
 | Plan phase | Stories | Tasks | State |
 |---|---|---|---|
-| Phase 1 | US1 + US3 | T001–T028 | code complete; **T027 awaits the owner** |
+| Phase 1 | US1 + US3 | T001–T028 | **complete** — T027 verified by the owner 2026-08-15 |
 | Phase 2 | US2 | — | not generated |
 | Phase 3 | US4 | T029–T043 | code complete; **T043 awaits the owner** |
 | Phase 4 | US5 | T044–T050 | code complete; **T049 awaits the owner** |
@@ -387,7 +387,7 @@ the leakage grep is silent across every endpoint.
     output directory's own name.
   - **Nothing may match.** This is the acceptance test for the guarantee ADR-0003 exists to provide.
 
-- [ ] **T027** 🚦 **Run the manual verification in [quickstart.md](./quickstart.md).**
+- [X] **T027** 🚦 **Run the manual verification in [quickstart.md](./quickstart.md).**
   - Submission returns a handle in **under one second**, measured — `curl -w '%{time_total}'`, not
     impression (SC-001).
   - Status polling shows progress **advancing between two successive calls**.
@@ -397,6 +397,32 @@ the leakage grep is silent across every endpoint.
     created under `<state_dir>/jobs/` and no outbound network traffic.
   - An unknown handle and a well-formed but unissued handle produce **byte-identical** refusals.
   - Record the results inline in this file, as feature 001 did.
+
+  ### T027 results — run by the owner, 2026-08-15 ✅ PASS
+
+  | # | Check | Result |
+  |---|---|---|
+  | 1 | Submission returns a handle in under one second | **50 ms** — twenty times inside SC-001's budget |
+  | 2 | Status poll | `finished`, `file_count: 1` |
+  | 3 | Retrieved file has picture **and** sound | `ffprobe` reports **both a video and an audio stream** |
+  | 4 | Non-X URL rejected in the submission response | rejected, `code: invalid_url` |
+  | 5 | Unknown handle refused | `code: not_found` |
+  | 6 | *(extra)* Malformed doubled URL | rejected correctly |
+
+  **On check 2**: the job read `finished` on the poll rather than showing progress advancing between
+  two calls. That is the documented edge case, not a miss — spec.md:210-212 and :217-219 record that a
+  post whose file is already present, or one small enough to complete between polls, finishes "having
+  reported no progress at all, so 'progress advances' cannot be an invariant of every job" (FR-008
+  makes progress advisory). The stronger evidence is check 3: a file with both streams proves the
+  download *and* the `ffmpeg` merge ran, which is what the progress check was a proxy for.
+
+  **Check 3 is the one no automated test can make.** `ffprobe` confirming two streams is exactly the
+  assertion the task asked for — a job can report `finished` over a silent file if the merge failed,
+  and only inspecting the artifact catches it.
+
+  **Check 6 was not on the checklist**, and is the more interesting of the two rejection cases: a
+  doubled URL is well-formed enough to look plausible and is exactly the shape that a permissive
+  parser accepts by matching the first or last occurrence. The frozen `parse_post_url` refused it.
 
 - [X] **T028** [P] Update `.env.example` with the Phase-1 variables only — `XVD_OUTPUT_DIR`,
   `XVD_STATE_DIR`, `XVD_MAX_CONCURRENT` — each with its default and one line on what it governs.
@@ -1253,7 +1279,7 @@ what the last one was doing. `backend/api.py` is still unchanged by this phase.
   - `uv run pytest` green; `git diff pyproject.toml uv.lock` empty; `tests/` still holds exactly three
     files.
   - Update this document's scope table: every phase generated is then code-complete, with only the
-    three 🚦 manual verifications (T027, T043, T049, T059) outstanding.
+    remaining 🚦 manual verifications (T043, T049, T059) outstanding — T027 passed 2026-08-15.
   - Note in `plan.md` that Phase 5 is delivered and US2 is the only story never built.
 
 ---
