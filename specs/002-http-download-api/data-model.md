@@ -78,20 +78,44 @@ existing one.
 A closed set of string constants with a fixed caller-safe sentence each. Two module-level dicts in
 `jobs.py`: the classification prefixes (D5) and the sentences (D6).
 
-| Code | Caller-safe sentence | Source |
-|---|---|---|
-| `no_video` | "This post does not contain a video." | classified (D5) |
-| `not_a_video` | "This post contains media, but it is not a video." | classified |
-| `protected_account` | "This post is from a protected account and is not publicly accessible." | classified |
-| `age_restricted` | "This post is age-restricted and is not publicly accessible." | classified |
-| `post_unavailable` | "This post could not be found. It may have been deleted." | classified |
-| `interrupted` | "The download was interrupted and did not complete. Submit it again to retry." | classified, or set by restart recovery (FR-025) |
-| `service_unavailable` | "The service cannot process downloads right now. The operator has been notified." | classified — `ffmpeg` missing is an operator fault, never described as one to the caller |
-| `time_limit` | "The download took too long and was stopped." | set by the jobs layer's own flag (D4), never by parsing text |
-| `unclassified` | "The download failed for an unexpected reason." | the deliberate, visible fallback (FR-011) |
+Sentences refined in US2 (plan Phase 2, T061–T065). **The codes themselves are frozen** by T014's
+coverage assertions — US2 changed values only, never keys.
+
+The **class** column is the axis US2's review ran along: the only decision a caller makes with this
+information is whether trying again could ever help, so every sentence must let them place their
+failure in one of three groups. `tests/test_jobs.py` encodes the classification as a frozenset and
+asserts that permanent failures never invite a retry and recoverable ones always do.
+
+| Code | Class | Caller-safe sentence | Source |
+|---|---|---|---|
+| `no_video` | permanent | "This post does not contain a video." | classified (D5) |
+| `not_a_video` | permanent | "The media item you asked for is not a video." | classified — **reachable only for an indexed URL** (`twitter.py:1351`, `:1359`), so the subject is the item, not the post |
+| `protected_account` | permanent | "This post is from a protected account and is not publicly accessible." | classified |
+| `age_restricted` | permanent | "This post is age-restricted and is not publicly accessible." | classified |
+| `post_unavailable` | permanent | "This post could not be found. It may have been deleted." | classified |
+| `interrupted` | transient | "The download was interrupted and did not complete. Submit it again to retry." | classified, or set by restart recovery (FR-025) |
+| `time_limit` | transient | "The download took too long and was stopped. Submit it again to retry; a slow transfer often succeeds on a second attempt." | set by the jobs layer's own flag (D4), never by parsing text |
+| `service_unavailable` | server-side | "The service cannot process downloads right now. This is a problem with the service, not with your link. Try again later." | classified — `ffmpeg` missing is an operator fault, never described as one to the caller |
+| `unclassified` | server-side | "The download failed for an unexpected reason. Nothing appears to be wrong with your link, so it is worth trying again." | the deliberate, visible fallback (FR-011) |
 
 **Rule**: every sentence is a literal in the source. None interpolates a path, a filename, a URL, a
-count, or any text originating outside this table.
+count, or any text originating outside this table. Since US2 this is enforced structurally rather
+than by convention — `test_every_caller_message_is_a_source_literal` walks the dict in the syntax
+tree and fails on an f-string, a `.format`, or a `%`.
+
+**Two wordings this table must not drift back to**, both corrected in US2:
+
+- `service_unavailable` said *"The operator has been notified."* **Nothing notifies anyone.** The
+  condition reaches the log and stops there, so the sentence promised a response that had not been
+  requested.
+- `no_video` must never mention images. yt-dlp cannot distinguish "images but no video" from "no
+  media at all" for a bare URL (`twitter.py:1349`; feature 001 research D6, FR-004's recorded
+  limitation), so any such wording would be a claim the service cannot support.
+
+**Known limitation, out of US2's scope**: an out-of-range index raises `Video #<n> is unavailable`
+(`twitter.py:1357`), which matches no needle in `_ERROR_DIAGNOSES` and therefore reports
+`unclassified`. Fixing it needs a new code, which would move the classifier and T014 — plumbing, not
+wording.
 
 ---
 

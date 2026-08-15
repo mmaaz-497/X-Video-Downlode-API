@@ -1070,22 +1070,57 @@ UNCLASSIFIED = "unclassified"
 # missing. That is an operator fault, and naming it would describe the server's
 # installation to the public.
 FAILURE_MESSAGES: dict[str, str] = {
+    # PERMANENT -- this post will never download, and no sentence here invites a
+    # retry. Sending a caller round a loop that cannot terminate is worse than
+    # telling them plainly to stop.
+    #
+    # Says nothing about images, deliberately. yt-dlp cannot tell an image-only
+    # post from a text-only one for a bare URL: the extractor filters on
+    # m['type'] != 'photo' (twitter.py:1349) and never reports what it removed,
+    # so both arrive as "No video could be found in this tweet"
+    # (twitter.py:1377). "This post has images but no video" would be a claim
+    # the service cannot support -- see feature 001 research D6, and FR-004's
+    # recorded limitation.
     NO_VIDEO: "This post does not contain a video.",
-    NOT_A_VIDEO: "This post contains media, but it is not a video.",
+    # Reachable ONLY when the caller named an index -- /video/2 or /photo/2.
+    # twitter.py:1351 branches on selected_index, and the raise at :1359 lives
+    # in the branch a bare URL never takes. So the subject of this sentence is
+    # the item they asked for, not the post: claiming to characterise the post's
+    # contents would assert exactly what the note above says is impossible.
+    NOT_A_VIDEO: "The media item you asked for is not a video.",
     PROTECTED_ACCOUNT: (
         "This post is from a protected account and is not publicly accessible."
     ),
     AGE_RESTRICTED: "This post is age-restricted and is not publicly accessible.",
     POST_UNAVAILABLE: "This post could not be found. It may have been deleted.",
+    # TRANSIENT -- retrying may genuinely work, so each of these says so without
+    # promising it.
     INTERRUPTED: (
         "The download was interrupted and did not complete. Submit it again to retry."
     ),
+    TIME_LIMIT: (
+        "The download took too long and was stopped. "
+        "Submit it again to retry; a slow transfer often succeeds on a second attempt."
+    ),
+    # SERVER-SIDE -- the caller's link is not the problem, and saying so stops
+    # them editing a URL that was fine.
+    #
+    # Does NOT say the operator has been notified. It used to, and nothing in
+    # this service notifies anyone: the condition reaches the log and stops
+    # there. A sentence promising a response nobody has been asked for leaves a
+    # caller waiting on a fix that may never be requested.
+    #
+    # Does not name ffmpeg either. A missing binary is an operator
+    # misconfiguration; naming it describes the server's installation to the
+    # public and tells the caller something they can neither use nor act on.
     SERVICE_UNAVAILABLE: (
         "The service cannot process downloads right now. "
-        "The operator has been notified."
+        "This is a problem with the service, not with your link. Try again later."
     ),
-    TIME_LIMIT: "The download took too long and was stopped.",
-    UNCLASSIFIED: "The download failed for an unexpected reason.",
+    UNCLASSIFIED: (
+        "The download failed for an unexpected reason. "
+        "Nothing appears to be wrong with your link, so it is worth trying again."
+    ),
 }
 
 # Ordered prefix -> code. Matched with str.startswith, which is exact rather

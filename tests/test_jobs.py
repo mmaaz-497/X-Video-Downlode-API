@@ -1632,6 +1632,135 @@ def test_records_still_propagate_so_capture_tooling_keeps_working(pristine_loggi
 
 
 # --------------------------------------------------------------------------
+# The failure-message catalog as a whole (US2: FR-010, FR-011, FR-029)
+#
+# The drift tests above pin the KEYS against the frozen module. These pin the
+# VALUES against the rules that make them safe and useful. US2 edited this table
+# by hand, and "every sentence is a literal" had until then been guaranteed by
+# everyone having behaved.
+# --------------------------------------------------------------------------
+
+# Decision 1 of the US2 breakdown: the only question a caller asks of a failure
+# message is whether trying again could ever help. Encoded here so the
+# classification is machine-checked rather than remembered.
+_PERMANENT = frozenset({
+    jobs.NO_VIDEO,
+    jobs.NOT_A_VIDEO,
+    jobs.PROTECTED_ACCOUNT,
+    jobs.AGE_RESTRICTED,
+    jobs.POST_UNAVAILABLE,
+})
+_WORTH_RETRYING = frozenset({
+    jobs.INTERRUPTED,
+    jobs.TIME_LIMIT,
+    jobs.SERVICE_UNAVAILABLE,
+    jobs.UNCLASSIFIED,
+})
+
+
+def _message_values() -> dict[str, ast.expr]:
+    """The FAILURE_MESSAGES dict as syntax, not as data.
+
+    Read from the source rather than from the imported dict because the
+    question is how each sentence was WRITTEN. By the time the module is
+    imported, an f-string and a literal are indistinguishable -- both are just
+    a str -- and the f-string is the one that could carry a path.
+    """
+    tree = _parse("jobs.py")
+    for node in ast.walk(tree):
+        target = None
+        if isinstance(node, ast.AnnAssign):
+            target = node.target
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == "FAILURE_MESSAGES":
+            assert isinstance(node.value, ast.Dict)
+            return {
+                ast.unparse(key): value
+                for key, value in zip(node.value.keys, node.value.values)
+            }
+    raise AssertionError("FAILURE_MESSAGES not found in backend/jobs.py")
+
+
+def test_every_caller_message_is_a_source_literal():
+    """The structural half of FR-029.
+
+    A path, a filename, or a URL can only reach a caller through this table if
+    something interpolates it, so the guarantee is not "nobody interpolates
+    anything" but "the syntax contains no interpolation to begin with". An
+    f-string, a .format call, or a % expression each turns this red -- verified
+    by mutation, because a structural guarantee that has never been shown to
+    fail is exactly what feature 001's T006 was.
+
+    Adjacent string literals are folded into one Constant by the parser, so a
+    sentence split across source lines for width still passes.
+    """
+    for key, value in _message_values().items():
+        assert isinstance(value, ast.Constant), (
+            f"{key}'s message is {type(value).__name__}, not a literal; "
+            "an interpolated message can carry a path to a caller (FR-029)"
+        )
+        assert isinstance(value.value, str), key
+
+
+def test_no_message_claims_the_operator_was_notified():
+    """It said so once, and nothing in this service notifies anyone.
+
+    The condition reaches the log and stops there. Promising a response nobody
+    has been asked for leaves a caller waiting on a fix that may never be
+    requested. A test is cheaper than remembering.
+    """
+    for code, message in jobs.FAILURE_MESSAGES.items():
+        assert "notified" not in message.lower(), code
+        assert "alerted" not in message.lower(), code
+
+
+def test_no_message_mentions_images():
+    """The FR-004 limitation, defended against a well-meaning future edit.
+
+    yt-dlp cannot distinguish "images but no video" from "no media at all" for a
+    bare URL -- the extractor filters photos out at twitter.py:1349 and never
+    reports what it removed. "This post has images but no video" would read as
+    more helpful and would be a claim the service cannot support.
+    """
+    for code, message in jobs.FAILURE_MESSAGES.items():
+        assert "image" not in message.lower(), code
+        assert "photo" not in message.lower(), code
+
+
+def test_permanent_failures_do_not_invite_a_retry():
+    """Sending a caller round a loop that cannot terminate is worse than
+    telling them plainly to stop."""
+    for code in _PERMANENT:
+        message = jobs.FAILURE_MESSAGES[code]
+        assert "again" not in message.lower(), (
+            f"{code} is permanent but invites a retry: {message!r}"
+        )
+
+
+def test_recoverable_failures_say_so():
+    """The other half. A truthful sentence that leaves the caller unable to
+    answer "should I try again?" has failed at its only job."""
+    for code in _WORTH_RETRYING:
+        message = jobs.FAILURE_MESSAGES[code]
+        assert "again" in message.lower(), (
+            f"{code} is worth retrying but does not say so: {message!r}"
+        )
+
+
+def test_the_retry_classification_covers_every_code():
+    """So a code added later cannot slip through unclassified by either test."""
+    assert _PERMANENT | _WORTH_RETRYING == set(jobs.FAILURE_MESSAGES)
+    assert not (_PERMANENT & _WORTH_RETRYING)
+
+
+def test_messages_stay_short_enough_to_read_on_a_phone():
+    """These land in a JSON field, often in a terminal, sometimes on a phone."""
+    for code, message in jobs.FAILURE_MESSAGES.items():
+        assert len(message) <= 160, f"{code} is {len(message)} characters"
+
+
+# --------------------------------------------------------------------------
 # The Principle III boundary (T025)
 #
 # Feature 001 checked this with `grep -nE "argparse|sys\.exit|print\("` and the

@@ -1539,7 +1539,7 @@ review enforces the intent.
 **Independent Test**: read each sentence cold and answer "should I try again?" — the three-way
 classification in decision 1 is the pass criterion, and T064 encodes the parts of it a test can hold.
 
-- [ ] **T061** [US2] Audit the nine sentences in `backend/jobs.py` against decision 1. **No code
+- [X] **T061** [US2] Audit the nine sentences in `backend/jobs.py` against decision 1. **No code
   change in this task.**
   - For each code, record: its class (permanent / transient / server-side), whether the current
     sentence lets a caller work that class out, and whether it says anything the service cannot
@@ -1550,7 +1550,49 @@ classification in decision 1 is the pass criterion, and T064 encodes the parts o
     that matters: confirm from `FAILURE_PREFIXES` and `twitter.py:1359` that it requires an indexed
     URL. A sentence written for a case that cannot occur is worse than no sentence.
 
-- [ ] **T062** [US2] Fix the two sentences that are **wrong** in `backend/jobs.py` (decision 2).
+  ### T061 audit — 2026-08-15
+
+  | Code | Class | Reachable via | Current sentence holds up? |
+  |---|---|---|---|
+  | `no_video` | permanent | bare URL, `twitter.py:1377` | ✅ correct, and correct **because** it says nothing about images |
+  | `not_a_video` | permanent | **indexed URL only**, `twitter.py:1359` | ❌ wrong subject — see below |
+  | `protected_account` | permanent | `twitter.py:1092` | ✅ |
+  | `age_restricted` | permanent | `twitter.py:1090` | ✅ |
+  | `post_unavailable` | permanent | `twitter.py:1086`, `:1093` | ✅ |
+  | `interrupted` | transient | operator stop, restart recovery | ✅ already the model — ends "Submit it again to retry." |
+  | `service_unavailable` | server-side | missing `ffmpeg` | ❌ **states a falsehood** — see below |
+  | `time_limit` | transient | jobs-layer flag (D4) | ⚠️ true but gives no guidance |
+  | `unclassified` | server-side | fallback | ⚠️ true but gives no guidance |
+
+  **Reachability of `not_a_video`, verified in source rather than assumed.** `twitter.py:1351` reads
+  `if self._yes_playlist(twid, selected_index, ...)`. The `else` branch containing the raise at `:1359`
+  is entered **only when `selected_index` is set**, which happens only when the URL carried an index.
+  A bare post URL always takes the playlist branch. Confirmed further that the frozen `parse_post_url`
+  accepts both `/video/<n>` and `/photo/<n>` and preserves them in `canonical_url`, so a caller really
+  can reach this code — it is not dead, it is just narrower than its sentence claims.
+
+  **`service_unavailable` asserts a process that does not exist.** "The operator has been notified" —
+  there is no alerting anywhere in the service. The condition reaches `_log`, and that is all. Since
+  the FR-033 logging fix an operator who is *watching* will see it; nobody is notified.
+
+  **Two sentences are merely incomplete rather than wrong** (`time_limit`, `unclassified`): both are
+  truthful and both leave the caller unable to answer "should I try again?", which decision 1 makes
+  the only question the sentence exists to answer.
+
+  ### Found during the audit, and NOT fixable in this phase
+
+  **An out-of-range index reports `unclassified`.** `twitter.py:1357` raises
+  `Video #<n> is unavailable` for an index past the end of a post's media. Our needle table matches
+  `"tweet is unavailable"` (`downloader.py`), which that string does not contain, so it falls through
+  to the generic branch and lands on `unclassified` — the caller asking for `/video/9` on a two-video
+  post is told "The download failed for an unexpected reason."
+
+  Truthful, but poor. **Fixing it needs a new failure code**, which would move `FAILURE_PREFIXES`,
+  `_classify`, and T014's coverage assertions — precisely the plumbing this phase's one rule forbids
+  touching. Recorded here rather than improvised: it belongs to a follow-up that owns the classifier,
+  and the standing instruction is to stop and report when a wording task turns out to need a code.
+
+- [X] **T062** [US2] Fix the two sentences that are **wrong** in `backend/jobs.py` (decision 2).
   - `SERVICE_UNAVAILABLE`: remove the "The operator has been notified" claim. Replace with something
     that places the fault on the service and tells the caller the link is not the problem — for
     example *"The service cannot process downloads right now. This is a problem with the service, not
@@ -1560,7 +1602,7 @@ classification in decision 1 is the pass criterion, and T064 encodes the parts o
     sentence stays a literal, and the caller already knows which index they sent.
   - Both are single-line dict edits. Nothing else in the module changes.
 
-- [ ] **T063** [US2] Give the transient and server-side codes an actionable ending in
+- [X] **T063** [US2] Give the transient and server-side codes an actionable ending in
   `backend/jobs.py` (decision 1).
   - `TIME_LIMIT` currently stops at *"The download took too long and was stopped."* — true, and it
     leaves the caller with no idea whether to retry. It is **transient**: a stalled transfer often
@@ -1575,7 +1617,7 @@ classification in decision 1 is the pass criterion, and T064 encodes the parts o
   - Keep every sentence to one or two short sentences. These appear in a JSON field, often in a
     terminal, sometimes on a phone.
 
-- [ ] **T064** [US2] Extend `tests/test_jobs.py` with the catalog properties a test can hold.
+- [X] **T064** [US2] Extend `tests/test_jobs.py` with the catalog properties a test can hold.
   - **Every sentence is a literal**: parse `backend/jobs.py` with `ast` and assert every value in the
     `FAILURE_MESSAGES` dict is an `ast.Constant` (or a `JoinedStr`-free concatenation of them) — never
     an f-string, a `%`, a `.format`, or a name. **This is the structural half of FR-029** and is
@@ -1592,7 +1634,7 @@ classification in decision 1 is the pass criterion, and T064 encodes the parts o
   - **T014's four assertions must pass unchanged.** Do not edit them; if one goes red, a key moved and
     the phase has exceeded its scope.
 
-- [ ] **T065** [US2] Update the documents that quote the sentences.
+- [X] **T065** [US2] Update the documents that quote the sentences.
   - [data-model.md](./data-model.md)'s `FailureCode` table carries all nine verbatim — bring it into
     line, and add the class column from decision 1 so the table records *why* each sentence is shaped
     as it is.
@@ -1600,6 +1642,42 @@ classification in decision 1 is the pass criterion, and T064 encodes the parts o
     a `409` example; update it if that sentence changed (it should not).
   - Note in data-model.md that the codes themselves are frozen by T014 and that US2 changed values
     only.
+
+  ### T062–T065 outcome — 2026-08-15
+
+  Four sentences changed, five untouched. **No key moved**, so T014's four assertions passed unedited
+  throughout.
+
+  | Code | Change |
+  |---|---|
+  | `not_a_video` | re-aimed at the item the caller named, not the post |
+  | `service_unavailable` | dropped the false "the operator has been notified" claim |
+  | `time_limit` | added the retry guidance it lacked |
+  | `unclassified` | added that the caller's link is not the problem |
+
+  `openapi.yaml` needed **no edit**: the only sentence it quotes is `no_video`'s, which was already
+  correct and deliberately unchanged.
+
+  **T064 is mutation-verified**, four ways — an f-string, a `.format`, a retry cue added to a
+  permanent code, and the "notified" claim restored. Each turned the intended test red; all reverted.
+  The first two matter most: "every sentence is a literal" was the FR-029 guarantee that had never
+  been shown capable of failing, which is the state feature 001's T006 was in when it was signed off
+  by eye.
+
+  ### Observed once during T065, diagnosed, not fixed here
+
+  `test_progress_updates_memory_but_not_disk` failed once with a `PermissionError`, then passed nine
+  consecutive runs. Diagnosed rather than re-run until green:
+
+  `_finish` sets the terminal state **inside** `_lock` and calls `persist()` **after** releasing it.
+  `_await_terminal` returns the moment the state is terminal — which is before `persist()` has
+  finished its `os.replace`. A test that then opens `<handle>.json` can catch Windows mid-swap and get
+  a sharing violation.
+
+  **The race is in the test, not in production.** Nothing in the service reads its own records except
+  `recover()`, which runs at start-up when no worker exists. The fix is for the test to wait for the
+  record rather than for the state, and it belongs to whoever next touches `_await_terminal` — it is
+  not a US2 change, and US2's rule is values in one dict.
 
 ---
 
