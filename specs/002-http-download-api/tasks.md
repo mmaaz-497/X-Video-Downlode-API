@@ -1,21 +1,30 @@
 ---
 
-description: "Phase 1 task list for 002-http-download-api (US1 + US3)"
+description: "Task list for 002-http-download-api — Phase 1 (US1 + US3), Phase 3 (US4), Phase 4 (US5)"
 ---
 
-# Tasks: HTTP Download API — Phase 1 (US1 + US3)
+# Tasks: HTTP Download API
 
 **Input**: Design documents from `/specs/002-http-download-api/`
 **Prerequisites**: [plan.md](./plan.md), [spec.md](./spec.md), [research.md](./research.md),
 [data-model.md](./data-model.md), [contracts/openapi.yaml](./contracts/openapi.yaml),
 [quickstart.md](./quickstart.md)
 
-**Scope**: **US1** (fetch a video without a terminal) and **US3** (callers cannot reach each other)
-only. US2, US4, US5, and US6 are deliberately absent — see *Explicitly Not In This Phase* below.
+**Scope of this document**, in the plan's numbering:
 
-**Tests**: Per Constitution Principle II, exactly one new test file, `tests/test_jobs.py`. No HTTP
-integration tests, no network calls, no mocking framework. Manual verification via `curl` closes the
-phase (T027).
+| Plan phase | Stories | Tasks | State |
+|---|---|---|---|
+| Phase 1 | US1 + US3 | T001–T028 | complete but for T027 |
+| Phase 2 | US2 | — | not generated |
+| **Phase 3** | **US4** | **T029–T043** | **generated below** |
+| **Phase 4** | **US5** | **T044–T050** | **generated below** |
+| Phase 5 | US6 | — | not generated |
+
+US2 and US6 are deliberately absent, by instruction. See *Explicitly Not In This Document*.
+
+**Tests**: Per Constitution Principle II, exactly one test file, `tests/test_jobs.py` — extended, never
+joined by a second. No HTTP integration tests, no network calls, no mocking framework. Manual
+verification via `curl` closes each phase (T027, T043, T049).
 
 ## Owner decisions recorded before this breakdown
 
@@ -392,22 +401,23 @@ the leakage grep is silent across every endpoint.
 
 ---
 
-## Explicitly Not In This Phase
+## Explicitly Not In This Document
 
 Named so that their absence reads as a decision rather than an oversight:
 
-| Deferred | Requirements | Belongs to |
-|---|---|---|
-| Full per-code message refinement | FR-010, FR-011 | US2 / plan Phase 2 |
-| Disk guard, rate limit, `XVD_MAX_PENDING`, job time limit + watchdog | FR-018, FR-019, FR-020, FR-015 cap | US4 / plan Phase 3 |
-| Retention sweep, `expired` transition | FR-021, FR-022, FR-023 | US5 / plan Phase 4 |
-| Restart recovery, temp-directory sweep | FR-024 (read side), FR-025, FR-026 | US6 / plan Phase 5 |
-| Wedged-worker mitigation | — | **Never.** Accepted limitation, ADR-0002 |
-| Docker, nginx, systemd, TLS | — | Out of scope by the spec |
+| Deferred | Requirements | Belongs to | Status |
+|---|---|---|---|
+| Full per-code message refinement | FR-010, FR-011 | US2 / plan Phase 2 | not generated |
+| Disk guard, rate limit, `XVD_MAX_PENDING`, job time limit + watchdog | FR-018, FR-019, FR-020, FR-015 cap | US4 / plan Phase 3 | **now T029–T043** |
+| Retention sweep, `expired` transition | FR-021, FR-022, FR-023 | US5 / plan Phase 4 | **now T044–T050** |
+| Restart recovery, temp-directory sweep | FR-024 (read side), FR-025, FR-026 | US6 / plan Phase 5 | not generated |
+| Wedged-worker mitigation | — | **Never.** Accepted limitation, ADR-0002 | never |
+| Docker, nginx, systemd, TLS | — | Out of scope by the spec | never |
 
 The `expired` branch in T019 and the write side of persistence in T004 are the two places where later
-phases are anticipated, each for a stated reason: avoiding a retrofit that would touch every
-transition.
+phases were anticipated, each for a stated reason: avoiding a retrofit that would touch every
+transition. **T019's branch is why Phase 4 below adds no transport code at all** — the anticipation
+paid off exactly as intended.
 
 ---
 
@@ -473,3 +483,533 @@ suite passes.
 - One new test file only: `tests/test_jobs.py`, holding T011, T014, and T025.
 - Prefer extending `backend/jobs.py` over adding a module. Two new files is the budget.
 - `[P]` marks independence, not staffing — this is a single-developer project.
+
+---
+---
+
+# Plan Phase 3 (US4) + Plan Phase 4 (US5)
+
+**Generated 2026-08-15.** Tasks **T029–T050**.
+
+## Why these two ship together
+
+They are the same problem approached from both ends. **US4 stops the disk filling; US5 empties it.**
+Either alone leaves a service that fails after enough use — US4 alone turns "disk full" from a
+mid-download crash into a permanent, polite refusal, and US5 alone has no floor under it while the
+sweep interval elapses. Neither is a complete answer to a finite disk. The spec already says as much:
+US5 is P3 "only because the disk threshold guard in US4 prevents the catastrophic version of this
+failure while retention is being built" (spec.md:159-161).
+
+They also share one mechanism — `jobs.sweep()`, built in T036 and extended in T045 — which is the
+practical reason a single breakdown beats two.
+
+---
+
+## Decisions recorded before the breakdown
+
+Five things had to be settled before tasks could be written honestly. Four are design choices; the
+third is a conflict with an existing test that would otherwise be discovered mid-implementation.
+
+### 1. The order of the guards in `submit()`, and what a deduplicated submission pays
+
+```text
+rate limit ─▶ parse_post_url ─▶ [ free-disk reading, outside the lock ]
+                                    │
+                                    ▼   ── under _lock ──
+                              dedup scan ──hit──▶ return existing job   (pays nothing further)
+                                    │ miss
+                                    ├──▶ disk verdict      (FR-018)
+                                    ├──▶ pending depth     (FR-015 amended)
+                                    └──▶ mint, insert, persist, audit, dispatch
+```
+
+Three properties this ordering is chosen for:
+
+- **A deduplicated submission is never refused for capacity.** It creates no job and consumes no
+  disk, so refusing it would be punishing a caller for work the service had already decided to do.
+  The dedup check therefore comes *before* the disk and depth verdicts are applied.
+- **The free-disk reading is taken outside `_lock` and applied inside it.** `shutil.disk_usage` is a
+  syscall; holding the registry lock across it would block every status poll and every worker
+  transition on the filesystem. Read first, decide later — the reading is at most microseconds stale
+  and the threshold is measured in gigabytes.
+- **The pending count is computed in the same pass as the dedup scan.** Both walk `_registry.values()`;
+  doing it twice would double an O(n) scan already on the hot path for no gain.
+
+### 2. Rate limiting counts *submissions*, not *jobs* — and this deviates from FR-019's literal wording
+
+FR-019 says "how many **jobs** a single caller may **create**". Research D9 says "on each
+**submission**". These differ for two cases, and the difference matters:
+
+| Case | Counted under "jobs created" | Counted here |
+|---|---|---|
+| A submission with an invalid URL | no | **yes** |
+| A deduplicated submission | no | **yes** |
+
+**The submission reading is adopted**, because the limiter's job is to bound the work one caller can
+impose, and an unbounded invalid-URL path is the cheapest abuse route available — it costs a
+validation pass and an audit append every time, and under the literal reading it would be free
+forever. A limiter that only counts successes protects the service from its well-behaved users.
+
+> ⚠️ **This is the one judgment call in this breakdown the owner may want to invert.** The cost is
+> that a caller who mistypes ten URLs is locked out for the rest of the window (defaults: 10 per
+> hour). If that is unacceptable, the change is small and local — move the `_rate_limit` call to
+> after `parse_post_url` succeeds — but it should be a decision, not a drift. It is called out here
+> rather than buried in a task bullet for that reason.
+
+### 3. The sweep loop breaks T025's no-loops assertion — resolved by a named, narrow exemption
+
+`tests/test_jobs.py::test_transport_layer_has_no_loops` (`tests/test_jobs.py:599-607`) asserts
+`backend/api.py` contains **zero** `ast.For` or `ast.While` nodes. The periodic sweep is
+`while True: await asyncio.sleep(...)` in `api.py`, so **T039 will turn that test red.**
+
+That test's own docstring says it is "cheap and blunt on purpose: if formatting a response ever
+genuinely needs a loop, that is worth a second look rather than a silent allowance". This is that
+second look, and the answer is to keep the guarantee while naming the exception:
+
+- The exemption is **one function, by name** — `_sweep_loop` — not a relaxed rule.
+- Every other function in `api.py` must still contain no loop, and the test must assert that
+  separately rather than counting a global total.
+- The exempted function must itself be asserted to contain **no iteration over domain data**: its
+  body sleeps and calls `asyncio.to_thread`, and it must not touch `jobs._registry` or any job.
+
+**Deleting or weakening the assertion is not an option.** It is the check that keeps request handlers
+from growing logic, and this is the first time it has fired — which is the test working, not
+failing.
+
+### 4. The clock is injected as a defaulted parameter — the T007 seam, reused
+
+`submit(..., now: Callable[[], float] = time.time)` and `sweep(*, now: Callable[[], float] = time.time)`.
+One parameter with a default, exactly as `download=download_post` is today (`backend/jobs.py:401`).
+Not a clock abstraction, not a freezegun dependency, not a module-global someone monkeypatches.
+
+This is what makes the rate limit, the deadline watchdog, and retention testable **without a single
+`time.sleep` in the suite** — a test hands in `lambda: base + 4000` and the hour has passed. Both
+parameters are keyword-only and `api.py` passes neither.
+
+### 5. "Wedged worker" is given a precise definition, because a vague one cannot be counted
+
+Research D4 requires `/health` to expose a wedged-worker count, and the contract defines it as
+"workers whose job the watchdog failed but which never returned"
+(`contracts/openapi.yaml:190`). Made operational:
+
+- When the watchdog fails a `running` job, add its handle to a module-level `_watchdog_failed` set.
+- `_run_job` discards its own handle from that set in a `finally`, so **every** return path clears
+  it — normal completion, exception, or a late return after the watchdog already ruled.
+- `wedged_workers = len(_watchdog_failed)`.
+
+The count is therefore exactly "started, was given up on, and has still not come back". It goes to
+zero on restart, which is correct: a restart is the only cure, and D4 says so.
+
+---
+
+## Phase 8: US4 service layer — `backend/jobs.py` (Priority: P2)
+
+**Goal**: every resource guard, callable as plain Python, with a clock a test can move.
+
+**Independent Test**: `tests/test_jobs.py` drives every refusal and the watchdog with no event loop,
+no HTTP client, no network, and **no elapsed real time**.
+
+All nine tasks edit `backend/jobs.py` and therefore run in sequence. None is `[P]`.
+
+- [ ] **T029** [US4] Add the Phase-3 configuration to `backend/jobs.py`.
+  - Six variables from the [data-model.md](./data-model.md) table, each with its documented default:
+    `XVD_MAX_PENDING` (50), `XVD_JOB_TIMEOUT` (1800), `XVD_MIN_FREE_BYTES` (2147483648),
+    `XVD_RATE_LIMIT` (10), `XVD_RATE_WINDOW` (3600), `XVD_SWEEP_INTERVAL` (900).
+  - `XVD_RETENTION` is **Phase 4** — T044 adds it. Do not add it now.
+  - `_positive_int` (`backend/jobs.py:62`) rejects `0`, which is right for a pool size and **wrong
+    for `XVD_MIN_FREE_BYTES`**: `0` is the operator's way to disable the disk guard on a volume where
+    it makes no sense. Add `_non_negative_int` for that one variable and use it. Do not loosen
+    `_positive_int` — a rate limit of `0` would mean "accept nothing", which is a configuration
+    mistake worth naming at start-up rather than serving.
+  - Read in `init()`, alongside the existing two, and hold at module level.
+
+- [ ] **T030** [US4] Change `submit()` to return a result object instead of raising, in
+  `backend/jobs.py`, and update every call site.
+  - **This is the one place Phase 3 changes an already-shipped signature, so it is its own task
+    rather than a bullet inside another.** Three new refusals (rate limit, disk, capacity) have to
+    cross the service boundary, and Principle VI forbids a custom exception hierarchy while `ValueError`
+    is already spoken for by the invalid URL.
+  - Add `@dataclass(frozen=True) SubmitResult(job: Job | None, problem: str | None, retry_after: int | None)`,
+    mirroring `FileResult` (`backend/jobs.py:675-689`) — which is itself the idiom `DownloadOutcome`
+    established in the frozen module. Returning "refused, and why" as a record is what this codebase
+    already does twice; a third exception type would be the inconsistent choice.
+  - `submit()` now returns `SubmitResult` for **every** outcome, including the invalid URL
+    (`problem="invalid_url"`), so the function has one shape instead of two. `parse_post_url` still
+    raises internally and is still caught; what changes is only how the refusal leaves this module.
+  - Update `backend/api.py:266-273` to read `result.problem` instead of catching `ValueError`.
+  - Update the 21 call sites in `tests/test_jobs.py` via a local helper —
+    `_accept(service, url, address, **kw) -> Job` that asserts `problem is None` and returns
+    `result.job`. The helper is not churn-hiding: it states at each site that the submission was
+    *expected* to succeed, which the bare call never did.
+  - **Verify**: `uv run pytest` is green before any guard is added. This task changes shape, not
+    behaviour, and proving that separately is the whole reason it is sequenced first.
+
+- [ ] **T031** [US4] Implement the per-address rate limit in `backend/jobs.py` (FR-019).
+  - `dict[str, deque[float]]`, address → submission timestamps in the window (research D9,
+    data-model.md `RateLimitBucket`).
+  - `submit(..., now: Callable[[], float] = time.time)` per decision 4. Evict timestamps older than
+    `now() - window` from the left of the deque, compare the length to the limit, and on refusal
+    return `SubmitResult(None, "rate_limited", retry_after=ceil(oldest + window - now()))`.
+  - `retry_after` is **an integer count of seconds computed on the server** — not a timestamp, not a
+    date string, and never anything derived from the request. It is the only number this module has
+    ever handed the transport for display, so state in a comment why it is safe under FR-029.
+  - Checked **first**, before `parse_post_url`, per decision 2. Put the reasoning in the code, not
+    only here — the next reader will otherwise "fix" the ordering.
+  - Guard the bucket dict with its own lock, not `_lock`. A submission must not queue behind a
+    registry scan to learn it is being refused.
+
+- [ ] **T032** [US4] Implement the free-disk guard in `backend/jobs.py` (FR-018).
+  - `shutil.disk_usage(_output_dir).free` compared against `XVD_MIN_FREE_BYTES`, **taken outside
+    `_lock` and applied inside it, and only on the create path** (decision 1).
+  - Skip the check entirely when the threshold is `0`.
+  - `OSError` from `disk_usage` — the output volume unmounted, a permissions change — must **fail
+    open with a logged warning**, not refuse every submission. A service that stops working because
+    it cannot measure its disk has converted a monitoring failure into an outage.
+  - Refusal is `SubmitResult(None, "disk_low", None)`. No job, no record, no dispatch — the check is
+    before creation, as FR-018 requires in terms.
+  - **The check cannot predict the file's size**, so a download can still exhaust the disk while
+    running (spec.md:222-224). That is a `failed` job, not a crash, and it is already handled by
+    `_run_job`'s existing `BaseException` arm. Do not add a second mechanism here.
+
+- [ ] **T033** [US4] Implement the pending-depth cap in `backend/jobs.py` (FR-015 as amended).
+  - Count jobs in `WAITING` in the same `_registry` pass as the dedup scan (decision 1). At or above
+    `XVD_MAX_PENDING`, return `SubmitResult(None, "at_capacity", None)`.
+  - The default of 50 against a concurrency limit of 2 is deliberate and the amended FR-015 says so:
+    ordinary over-limit submissions still wait exactly as the original wording promised, and only the
+    far tail is refused. **Do not tighten the default to something that would make waiting rare** —
+    that would quietly reverse the requirement this cap was written to preserve.
+  - The cap exists because the per-address rate limit bounds one caller but not the aggregate across
+    many addresses (spec.md:297-302). Say that at the code, since the cap looks redundant beside the
+    rate limit until you have read why it is not.
+
+- [ ] **T034** [US4] Extend the audit trail with the three new outcomes in `backend/jobs.py`.
+  - Add `RATE_LIMITED`, `DISK_LOW`, and `AT_CAPACITY` alongside the existing constants
+    (`backend/jobs.py:350-352`), completing the `outcome` enum in
+    [data-model.md](./data-model.md)'s `SubmissionRecord`.
+  - `canonical_url` is `None` for a rate-limited refusal, exactly as it is for `rejected_url`: the
+    rate limit is checked *before* validation, so at that moment the URL is still unvalidated
+    caller-supplied text, and FR-032 forbids storing it. For `disk_low` and `at_capacity` the URL has
+    passed validation and **is** recorded.
+  - This asymmetry is a direct consequence of decision 2's ordering. Note it at the code — it looks
+    like an inconsistency until you know why.
+  - A run of `rate_limited` lines from one address is the single most useful pattern the log can
+    show, which is the reason FR-031 asks for refusals at all.
+
+- [ ] **T035** [US4] Enforce the job deadline from the progress callback in `backend/jobs.py`
+  (FR-020, research D4).
+  - Add a `timed_out: bool = False` field to `Job` **and add the row to
+    [data-model.md](./data-model.md)'s table in the same task.** The `Job` docstring
+    (`backend/jobs.py:178-189`) demands that any new field be a visible change to that table; a bool
+    flag carries no free text and so does not touch the FR-029 guarantee, but the table is the record
+    and it must stay true.
+  - In `_make_progress_hook`, when `now() > job.started_at + XVD_JOB_TIMEOUT`: set `job.timed_out`,
+    then `raise RuntimeError("job time limit exceeded")`.
+  - **`RuntimeError` specifically.** Principle VI names it as an approved built-in, and — more
+    load-bearing — it must not subclass `OSError` or any network exception, or yt-dlp's handler at
+    `YoutubeDL.py:3597` would swallow it and merely report an error instead of aborting (research
+    D4.1). Write that reason in the code; it is not guessable.
+  - `_run_job`'s exception arms (`backend/jobs.py:530-540`) must check `job.timed_out` and record
+    `TIME_LIMIT` rather than `UNCLASSIFIED`. **Identified by the flag, never by parsing the message** —
+    `download_post` wraps text as `f"download failed for video {position}: {detail}"`
+    (`backend/downloader.py:534`), which no classifier should have to reverse-engineer.
+  - `timed_out` is **not** added to `_as_record`. `failure_code` already carries the outcome to disk;
+    the flag is a within-process signal between the callback and the worker.
+  - Abort and cleanup are guaranteed by two independent paths, both verified in research D4.1 — the
+    hook's exception propagating, and `download_post`'s non-zero-retcode backstop at
+    `backend/downloader.py:511-512`. Either lands in a handler that runs the `finally` removing the
+    temp directory. **No cleanup code is needed here**; adding some would duplicate a frozen module's
+    guarantee.
+
+- [ ] **T036** [US4] Implement `sweep()` in `backend/jobs.py` — the watchdog and the bucket prune.
+  - A plain synchronous function taking `*, now: Callable[[], float] = time.time`. **It must not
+    import or mention `asyncio`** — `tests/test_jobs.py:556-566` walks this module's imports and
+    fails on it. The periodic caller lives in `api.py` (T039); this is the work, not the schedule.
+  - **Watchdog**: every job in `RUNNING` whose `started_at + XVD_JOB_TIMEOUT` has passed →
+    `_finish(job, FAILED, failure_code=TIME_LIMIT)`. This decouples the *job's* state from the
+    *thread's* state, so a caller is never left waiting on a wedged worker even when no callback ever
+    fires to raise (research D4).
+  - **Wedged tracking** per decision 5: add the handle to `_watchdog_failed` here; discard it in a
+    `finally` in `_run_job`. Log a **distinctly identifiable** operator warning at this point — D4
+    names this as the chosen mitigation, and a warning nobody can grep for is not one.
+  - **Bucket prune**: drop rate-limit entries whose deque is empty after eviction, so the dict cannot
+    grow without bound from one-off callers (research D9).
+  - Retention is **T045** and slots in between the watchdog and the prune. Leave the ordering comment
+    in place now so the sequence is not rearranged later by accident.
+  - `_finish` already refuses a transition on an already-terminal job (`backend/jobs.py:207-231`), so
+    a worker that returns after the watchdog ruled cannot overwrite the verdict. **That guard was
+    built in T003 for exactly this race** — it stops being hypothetical in this task.
+
+- [ ] **T037** [US4] Extend `tests/test_jobs.py` for every Phase-3 behaviour. **No `time.sleep`
+  anywhere.**
+  - Rate limit: the Nth submission inside the window is refused; `retry_after` is a positive integer;
+    a submission after `now` advances past the window is accepted again; a second address is
+    unaffected. All driven by handing `submit` a fake `now`.
+  - Rate limit counts invalid URLs and deduplicated submissions — assert decision 2's chosen
+    behaviour explicitly, so inverting it later is a **failing test and a conversation**, not a
+    silent change.
+  - Disk guard: below threshold refuses and creates no job and no record; a threshold of `0` disables
+    it; `OSError` from the measurement fails **open**. Inject the free-space reading through a
+    defaulted parameter, the same seam pattern — do not fill a temp volume.
+  - Pending cap: at depth the next submission is refused with `at_capacity`; **a deduplicated
+    submission is still accepted at capacity**, which is decision 1's whole point.
+  - Deadline: a stub `download` that invokes the progress hook after the clock has passed the
+    deadline lands the job in `failed`/`time_limit`, not `unclassified`.
+  - Watchdog: a job left `running` past its deadline is failed by `sweep(now=...)`; a late worker
+    return does **not** overwrite it; `wedged_workers` reads 1 and returns to 0 once the worker
+    returns.
+  - Audit: one line per refusal with the right `outcome`, and `canonical_url` is `null` for
+    `rate_limited` and non-null for `disk_low`.
+
+**Checkpoint**: `uv run pytest` passes. Every guard works from plain Python, and the whole suite still
+runs in the time it did before. `backend/api.py` is unchanged.
+
+---
+
+## Phase 9: US4 transport — `backend/api.py` (Priority: P2)
+
+**Goal**: the refusals over HTTP, and the schedule that drives the sweep.
+
+- [ ] **T038** [US4] Map the new refusals to status codes in `backend/api.py`.
+  - `rate_limited` → **429** with a **`Retry-After` header** carrying the integer seconds from
+    `SubmitResult.retry_after`, and the body from
+    [contracts/openapi.yaml](./contracts/openapi.yaml):60-71. The header is required by FR-019 —
+    "a refusal MUST state when the caller may retry" — and a header a client already knows how to
+    obey beats a sentence only a human reads.
+  - `disk_low` → **503** `insufficient_storage`. `at_capacity` → **503** `at_capacity`.
+  - Both 503 messages are literals in `api.py`. Neither names the disk, the volume, the threshold,
+    the queue depth, or how many jobs are pending — those are facts about the server, and FR-029
+    admits none of them.
+  - The message may interpolate `retry_after` only. That number is server-computed, like the file
+    count already interpolated at `backend/api.py:328-332`, and is the sole exception for the same
+    reason.
+
+- [ ] **T039** [US4] Run `jobs.sweep()` periodically from `backend/api.py`'s lifespan (research D7).
+  - `_sweep_loop`: `while True: await asyncio.sleep(XVD_SWEEP_INTERVAL)` then
+    `await asyncio.to_thread(jobs.sweep)`. **`to_thread` is not optional** — `sweep` does filesystem
+    work in T045 and must never run on the event loop.
+  - Started as a task in `lifespan` (`backend/api.py:36-44`) and **cancelled with its
+    `CancelledError` awaited** on shutdown, or the loop outlives the executor it depends on.
+  - Wrap the body so one sweep raising cannot kill the loop. A sweep that dies silently means
+    retention stops forever while the service looks healthy — the worst available failure mode, and
+    invisible without this.
+  - **Then amend `test_transport_layer_has_no_loops` per decision 3**: exempt `_sweep_loop` **by
+    name**, assert every other function in `api.py` is still loop-free, and assert `_sweep_loop`
+    itself references no job data. Update the test's docstring to record why the exemption exists —
+    the next reader must find the reason at the assertion, not in this file.
+
+- [ ] **T040** [US4] Add `GET /health` to `backend/api.py`
+  (contract at [contracts/openapi.yaml](./contracts/openapi.yaml):170-190).
+  - Body: `status` (`ok` | `degraded`), `running`, `waiting`, `wedged_workers`. `degraded` when
+    `wedged_workers > 0`.
+  - The counting is a `jobs.health()` call returning a plain dict; `api.py` serialises it. Counting
+    registry states in a handler would be domain iteration in the transport — and would trip T039's
+    own amended loop check, which is the check doing its job.
+  - **No handles, no URLs, no addresses, no paths.** This endpoint is unauthenticated and reachable
+    by anyone; it may carry aggregate counts and nothing else.
+  - `wedged_workers` is the visible face of the accepted limitation in ADR-0002. Exposing it is why
+    an operator can tell "the service is slow" from "the service has lost half its capacity and needs
+    a restart".
+
+- [ ] **T041** [P] [US4] Correct the stale proxy-header docstring in `backend/api.py:358-364`.
+  - It still says "without those flags every caller collapses into the proxy's single address",
+    which the T023 correction disproved: `proxy_headers` defaults to **`True`** and
+    `forwarded_allow_ips` to **`"127.0.0.1"`** (`uvicorn/config.py:355-357`). research.md D9,
+    quickstart.md, and `.env.example` were corrected; **this docstring was missed.**
+  - Replace it with the three-case summary already in research D9, and point at that entry rather
+    than restating it a fourth time.
+  - **This is not cosmetic in this phase specifically.** T031's rate limit is keyed on
+    `request.client.host`, and a docstring telling an operator the wrong thing about which addresses
+    are believed is a docstring that gets the rate limit bypassed. A directly exposed service must
+    pass `--no-proxy-headers`, and nothing in the code currently says so.
+
+- [ ] **T042** [P] [US4] Update the contract and the operator-facing documents.
+  - [contracts/openapi.yaml](./contracts/openapi.yaml): the `/jobs` `503` currently documents only
+    `insufficient_storage`. Add the `at_capacity` example — FR-015's amendment introduced a second
+    503 and the contract never caught up.
+  - `.env.example`: the six T029 variables, each with its default and one line on what it governs.
+  - [quickstart.md](./quickstart.md) § "Concurrency and the queue (US4, later phase)" — drop "later
+    phase" and add the `curl` sequences T043 will run: rate limit with its `Retry-After`, the
+    at-capacity refusal, and `/health` reporting a wedged worker.
+
+**Checkpoint**: 🚦 **US4 is independently verifiable.** Exceed the rate limit and get a 429 with a
+usable `Retry-After`; drop the disk threshold above free space and get a clean 503 with no job
+created; `/health` answers.
+
+---
+
+## Phase 10: US4 verification
+
+- [ ] **T043** 🚦 **STOP. Manual verification of US4 — the owner runs this.**
+  *(Per instruction: a manual verification task per phase, and stop before it.)*
+  - Ten simultaneous submissions against a concurrency limit of 2: **no more than two run at any
+    instant and all ten reach a terminal state** (SC-006). Poll `/health` during, do not infer it.
+  - The same post URL submitted five times concurrently produces **exactly one** download (SC-007).
+  - Exceed `XVD_RATE_LIMIT`: 429, a `Retry-After` header whose value is a plausible integer, and
+    submission works again once it has elapsed.
+  - Set `XVD_MIN_FREE_BYTES` above actual free space: every submission refused with 503, **no file
+    under `<state_dir>/jobs/`**, and no outbound network traffic.
+  - Set `XVD_MAX_PENDING=2` with `XVD_MAX_CONCURRENT=1` and submit four distinct URLs: the fourth is
+    refused `at_capacity` while the second and third still **wait** rather than being dropped —
+    FR-015's original promise must survive its own amendment.
+  - Set `XVD_JOB_TIMEOUT` to a few seconds and submit a real download: the job reaches
+    `failed`/`time_limit`, and the temp directory under the output directory is **gone**.
+  - Record results inline in this file, as feature 001 did.
+
+---
+
+## Phase 11: US5 service layer — `backend/jobs.py` (Priority: P3)
+
+**Goal**: finished files stop accumulating, and a caller who comes back too late is told so.
+
+**Independent Test**: complete a job, hand `sweep()` a `now` past the retention period, confirm the
+file is gone, the job reports `expired`, and `file_for` refuses.
+
+- [ ] **T044** [US5] Add `XVD_RETENTION` and the `finished → expired` transition to `backend/jobs.py`.
+  - `XVD_RETENTION` (default 86400) via `_positive_int`, read in `init()` beside the others.
+  - `_enter_terminal` **refuses** this transition — `FINISHED` is in `_TERMINAL_STATES`
+    (`backend/jobs.py:225-226`) — and that refusal is correct for every other caller. Add a separate
+    `_expire(job) -> bool` that permits **exactly** `FINISHED → EXPIRED` and nothing else.
+  - Invariant 1 in [data-model.md](./data-model.md):59-62 already names this as the one exception to
+    "a terminal state is never left". Implement it as a second, narrower function rather than by
+    loosening the first: a `_enter_terminal` that could be talked into leaving a terminal state stops
+    being the guard T003 built.
+  - `_expire` must **not** clear `job.files`. T046's retry needs the paths, and a caller sees only
+    the count regardless.
+
+- [ ] **T045** [US5] Add the retention pass to `sweep()` in `backend/jobs.py` (FR-021, FR-023).
+  - Between the watchdog and the bucket prune, per T036's ordering comment.
+  - Every `FINISHED` job whose `completed_at + XVD_RETENTION` has passed, measured with the injected
+    `now`: **mark `expired` and persist first, then attempt deletion** (FR-023, research D7).
+  - **The ordering is the requirement, not an implementation detail.** A retrieval that starts after
+    the mark is refused with a clean "expired" instead of racing a file that is disappearing under
+    it. A retrieval already in flight keeps its open handle: POSIX `unlink` leaves an open file
+    readable until the reader closes it, so the response completes intact — that is the deployment
+    target and the reason this ordering is sufficient rather than merely tidy.
+  - Retention is measured **from the job's completion, not the file's age on disk**. A job that
+    finished instantly by reusing a file an earlier CLI run left behind gets a full retention period
+    from *its* completion (spec.md:213-216).
+
+- [ ] **T046** [US5] Tolerate a delete that fails, in `backend/jobs.py`.
+  - On Windows the `unlink` raises `PermissionError` while a reader holds the file open. **Log at
+    debug and move on**; the next sweep tries again. This is the same reasoning
+    `_remove_temp_dir` documents at `backend/downloader.py:270-292`, for the same underlying cause —
+    cite it, so the consistency is visible rather than coincidental.
+  - The retry needs no new state: each pass attempts `unlink` on any file of an `EXPIRED` job that
+    still exists. The job is already `expired`, so `file_for` refuses regardless of whether the bytes
+    are still there — **the caller-visible guarantee does not depend on the delete succeeding**,
+    which is what makes tolerating the failure safe rather than merely convenient.
+  - A file deleted out from under the service by an operator is already handled: `file_for` re-checks
+    existence and reports `expired` (`backend/jobs.py:733-735`). Do not add a second path.
+
+- [ ] **T047** [US5] Extend `tests/test_jobs.py` for retention. Still no `time.sleep`.
+  - A job finished longer ago than the retention period is `expired` by `sweep(now=...)`, its file is
+    gone, and `file_for` returns the `expired` problem.
+  - A job finished **within** the period is untouched: state, file, and record all unchanged
+    (US5 acceptance scenario 2).
+  - `expired` is distinguishable from `failed` — different state, and `failure_code` stays `None`,
+    preserving data-model invariant 4.
+  - A `PermissionError` from the delete leaves the job `expired` anyway, and the next sweep retries.
+    Drive it with a `unlink` seam, not by opening a file on Windows and hoping.
+  - `waiting`, `running`, and `failed` jobs are never expired by the sweep, whatever their age.
+  - The record on disk says `expired` after the sweep — mark-before-delete has to survive a read.
+
+**Checkpoint**: `uv run pytest` passes. Retention works from plain Python.
+
+---
+
+## Phase 12: US5 close-out and verification
+
+- [ ] **T048** [US5] Confirm — by assertion, not by assumption — that US5 needs no transport change.
+  - `backend/api.py` already returns **410** `expired` for an expired job
+    (`backend/api.py:337-338`), and `file_for` already reports the `EXPIRED` problem
+    (`backend/jobs.py:702-703`). Both were written in T019 against a state that could not yet occur.
+  - Add a test asserting `jobs.EXPIRED` is handled by `_serve`'s branch table, so the branch cannot
+    be deleted as dead code by someone who does not know retention reaches it.
+  - Then update `.env.example` with `XVD_RETENTION`, and [quickstart.md](./quickstart.md) with the
+    US5 sequence. **If `api.py` turns out to need a change after all, stop and report it** — it would
+    mean T019's anticipation was wrong, which is worth knowing rather than patching over.
+
+- [ ] **T049** 🚦 **STOP. Manual verification of US5 — the owner runs this.**
+  - Complete a real job, set `XVD_RETENTION=60` and `XVD_SWEEP_INTERVAL=10`, wait, and confirm: the
+    file is gone from the output directory, `GET /jobs/{handle}` reports **`expired`** and not
+    `failed`, and `GET /jobs/{handle}/file` returns **410** with the expired message.
+  - A job finished seconds ago is **untouched** by the same sweep.
+  - **The mark-before-delete ordering, observed rather than reasoned about**: start a retrieval of a
+    large file and let the sweep fire mid-transfer. The download must complete intact on Linux. On
+    Windows the delete will fail and the operator log must show the tolerated failure and a
+    successful retry on the following pass.
+  - Confirm no finished file survives more than retention plus one sweep interval (SC-009).
+  - Record results inline in this file.
+
+- [ ] **T050** Close both phases out.
+  - **Verify**: `git diff --stat HEAD -- backend/downloader.py backend/validation.py backend/config.py`
+    prints nothing. Same standing instruction, same backstop as T024 — if a task above needed one of
+    these, **stop and report** rather than editing.
+  - `uv run pytest` green, including the amended AST checks from T039.
+  - Confirm no new dependency: `git diff pyproject.toml` shows nothing. The sweep is
+    `asyncio.sleep` in a loop, not a scheduler library (Principle IV).
+  - Confirm one test file: `tests/` still contains exactly `test_validation.py`,
+    `test_downloader.py`, and `test_jobs.py`.
+  - Update this document's scope table and the *Explicitly Not In This Document* table so US4 and US5
+    read as done and only US2 and US6 remain.
+
+---
+
+## Dependencies & Execution Order (T029–T050)
+
+```text
+T029 (config)
+  └─> T030 (SubmitResult — signature change, suite green before any guard)
+        └─> T031 ──> T032 ──> T033 ──> T034 ──> T035 ──> T036 ──> T037
+                                                          [Phase 8: US4 service, all in jobs.py]
+              └─> T038 ──> T039 ──> T040 ──> T041 [P] ──> T042 [P]
+                                                          [Phase 9: US4 transport]
+                    └─> T043  🚦 STOP — owner runs this
+                          └─> T044 ──> T045 ──> T046 ──> T047
+                                                          [Phase 11: US5 service, all in jobs.py]
+                                └─> T048 ──> T049  🚦 STOP — owner runs this ──> T050
+                                                          [Phase 12: close-out]
+```
+
+**Hard sequencing rules**:
+
+- **T030 blocks every guard.** They all return a `SubmitResult`, and changing the shape while adding
+  behaviour would make a red test ambiguous between the two.
+- **T029 → T037 are strictly sequential**: they all edit `backend/jobs.py`.
+- **T039 must not be split from its test amendment.** Adding the loop without amending the assertion
+  leaves the suite red; amending the assertion without adding the loop leaves an exemption for a
+  function that does not exist. One task, both halves.
+- **T036 blocks T045.** Retention is a pass inside the sweep the watchdog task creates.
+- **T043 gates Phase 11.** US4 is what keeps the disk from filling while US5 is being built; verifying
+  it after would invert the safety argument that put them in this order.
+- **T044 → T047 are strictly sequential**: `backend/jobs.py` again.
+
+### Parallel Opportunities
+
+Two: **T041** and **T042**. T041 edits a docstring in `api.py` that no other task touches, and T042
+edits three documents and no code. Nothing in Phase 8 or Phase 11 is parallel — fourteen of these
+twenty-two tasks edit `backend/jobs.py`, and marking two of them `[P]` would be a lie about a merge
+conflict waiting to happen.
+
+---
+
+## Implementation Strategy
+
+**T029–T043 first, as one unit.** US4 is a safety property, and a service that has retention but no
+disk floor still fails the first time a caller submits a 4 GB post at 90% full. The disk guard is the
+thing that makes US5's periodic sweep sufficient rather than merely hopeful.
+
+**Then T044–T050.** Retention is where the disk actually gets emptied, and it is short — five tasks,
+one of which is confirming that a branch written in T019 still fits.
+
+### Suggested commit points
+
+After T030 (the contract change, alone and green), T037, T042, T047, and T050. Each is a state where
+the tree is coherent and the suite passes.
+
+### What is still not built after T050
+
+US2 (per-code message refinement) and US6 (restart recovery, temp sweep). US6 is worth naming
+specifically: **T044's persistence writes an `expired` state that nothing yet reads back**, exactly as
+T004 wrote records nothing read. That is the same deliberate anticipation, and US6 is where it is
+finally collected.

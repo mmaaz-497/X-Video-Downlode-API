@@ -131,6 +131,25 @@ def _not_found() -> JSONResponse:
     return _error(404, "not_found", "No such job.")
 
 
+def _refused(result: jobs.SubmitResult) -> JSONResponse:
+    """Render a refused submission. Every sentence below is a literal here.
+
+    The service layer returns a code; this table turns it into a status and a
+    fixed message. Nothing from the request and nothing from an exception's text
+    reaches a caller by this path -- in particular, parse_post_url's ValueError
+    names the URL and the accepted hosts, and is logged one layer down rather
+    than repeated here (FR-005).
+    """
+    if result.problem == jobs.INVALID_URL:
+        return _error(400, "invalid_url", "That is not a valid X post URL.")
+
+    # A problem this table does not know is a bug in the layer below, not a
+    # caller error. It gets the generic body rather than its own code leaking
+    # out as an unplanned vocabulary word.
+    _log.error("unmapped submission problem %r", result.problem)
+    return _error(500, "internal_error", "The service could not complete that request.")
+
+
 def _lookup(handle: str) -> jobs.Job | None:
     """Resolve a handle, treating a malformed one exactly like an unknown one.
 
@@ -260,17 +279,15 @@ def submit_job(body: SubmitRequest, request: Request) -> JobResponse | JSONRespo
     caller cannot tell, and has no reason to care -- they hold a handle for the
     work they asked for either way (FR-016).
     """
-    try:
-        # No `download` argument. That parameter is a test seam and this layer
-        # must never be the thing that supplies it.
-        job = jobs.submit(body.url, _caller(request))
-    except ValueError:
-        # parse_post_url's ValueError names the URL and the accepted hosts. It
-        # is useful to an operator and is written to the log by the service
-        # layer; it is not repeated here, because echoing a caller's own string
-        # back to them is what FR-005 forbids.
-        return _error(400, "invalid_url", "That is not a valid X post URL.")
-    return _as_response(job)
+    # No `download` and no `now` argument. Both are test seams and this layer
+    # must never be the thing that supplies them.
+    result = jobs.submit(body.url, _caller(request))
+
+    if result.problem is not None:
+        return _refused(result)
+
+    assert result.job is not None  # a result carries a job or a problem
+    return _as_response(result.job)
 
 
 @app.get("/jobs/{handle}", response_model=JobResponse, responses={404: {"model": Error}})

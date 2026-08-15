@@ -18,12 +18,15 @@ the same thing whether they arrived over HTTP or not.
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import secrets
+import shutil
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -38,16 +41,31 @@ from backend.validation import parse_post_url
 # read here with os.environ -- the same pattern config.output_dir uses, not an
 # extension of it.
 #
-# The rest of the table in data-model.md -- job timeout, retention, sweep
-# interval, free-disk floor, rate limit, pending cap -- belongs to later phases
-# and is deliberately absent. Reading a variable the service does not act on
-# would advertise configuration that does nothing.
+# XVD_RETENTION is the one row of data-model.md's table still absent: it belongs
+# to the retention sweep and is added with it. Reading a variable the service
+# does not act on would advertise configuration that does nothing.
 ENV_STATE_DIR = "XVD_STATE_DIR"
 ENV_MAX_CONCURRENT = "XVD_MAX_CONCURRENT"
+ENV_MAX_PENDING = "XVD_MAX_PENDING"
+ENV_JOB_TIMEOUT = "XVD_JOB_TIMEOUT"
+ENV_MIN_FREE_BYTES = "XVD_MIN_FREE_BYTES"
+ENV_RATE_LIMIT = "XVD_RATE_LIMIT"
+ENV_RATE_WINDOW = "XVD_RATE_WINDOW"
+ENV_SWEEP_INTERVAL = "XVD_SWEEP_INTERVAL"
 
 _log = logging.getLogger("xvd.jobs")
 
 _DEFAULT_MAX_CONCURRENT = 2
+# Far above the concurrency limit on purpose. FR-015 promises that an ordinary
+# over-limit submission WAITS, and that promise survives its own amendment only
+# while the cap sits in the far tail: at 2 concurrent and 50 pending, a caller
+# has to be the 51st in the queue before anything is refused.
+_DEFAULT_MAX_PENDING = 50
+_DEFAULT_JOB_TIMEOUT = 1800  # 30 minutes
+_DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+_DEFAULT_RATE_LIMIT = 10
+_DEFAULT_RATE_WINDOW = 3600  # 1 hour
+_DEFAULT_SWEEP_INTERVAL = 900  # 15 minutes
 
 # Set by init(). Module-level rather than passed around because there is exactly
 # one of each per process, and threading them through every call would be
@@ -56,10 +74,36 @@ _output_dir: Path | None = None
 _state_dir: Path | None = None
 _jobs_dir: Path | None = None
 _max_concurrent: int = _DEFAULT_MAX_CONCURRENT
+_max_pending: int = _DEFAULT_MAX_PENDING
+_job_timeout: int = _DEFAULT_JOB_TIMEOUT
+_min_free_bytes: int = _DEFAULT_MIN_FREE_BYTES
+_rate_limit: int = _DEFAULT_RATE_LIMIT
+_rate_window: int = _DEFAULT_RATE_WINDOW
+_sweep_interval: int = _DEFAULT_SWEEP_INTERVAL
 _executor: ThreadPoolExecutor | None = None
 
+# address -> submission timestamps still inside the window (research D9).
+#
+# Its own lock, not _lock. A caller being refused must not have to queue behind
+# a registry scan to find that out, and the two structures guard nothing in
+# common.
+#
+# Not persisted: the state is lost on restart, so every caller gets a fresh
+# allowance immediately afterwards. Stated rather than hidden. Writing it to
+# disk would put a write on the hot submission path to defend against an
+# attacker who would need to be able to restart the service to exploit it --
+# and anyone who can do that has already won.
+_rate_buckets: dict[str, deque[float]] = {}
+_rate_lock = threading.Lock()
 
-def _positive_int(name: str, default: int) -> int:
+# Handles the watchdog gave up on whose worker has not returned -- the accepted
+# limitation of ADR-0002 made countable. Declared here with the other process
+# state because init() clears it; the functions that maintain it live with the
+# sweep.
+_watchdog_failed: set[str] = set()
+
+
+def _int_env(name: str, default: int, *, minimum: int) -> int:
     """Read an integer environment variable, refusing values that make no sense.
 
     A max_concurrent of 0 would accept jobs and never run them, and a negative
@@ -74,9 +118,30 @@ def _positive_int(name: str, default: int) -> int:
         value = int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be a whole number, got {raw!r}") from exc
-    if value < 1:
-        raise ValueError(f"{name} must be at least 1, got {value}")
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {value}")
     return value
+
+
+def _positive_int(name: str, default: int) -> int:
+    """A count that is meaningless at zero: pool size, queue depth, a rate limit.
+
+    A rate limit of 0 would mean "accept nothing from anyone", which is a
+    configuration mistake rather than an intent, so it is refused rather than
+    served.
+    """
+    return _int_env(name, default, minimum=1)
+
+
+def _non_negative_int(name: str, default: int) -> int:
+    """A threshold where zero is a legitimate instruction, not a mistake.
+
+    XVD_MIN_FREE_BYTES=0 is how an operator disables the free-disk guard on a
+    volume where it makes no sense -- a container with an ephemeral overlay, or
+    a filesystem whose free-space figure lies. Refusing zero would leave them
+    setting it to 1 byte and meaning the same thing less clearly.
+    """
+    return _int_env(name, default, minimum=0)
 
 
 def init() -> None:
@@ -89,6 +154,8 @@ def init() -> None:
     variables and call this again.
     """
     global _output_dir, _state_dir, _jobs_dir, _max_concurrent
+    global _max_pending, _job_timeout, _min_free_bytes
+    global _rate_limit, _rate_window, _sweep_interval
 
     # No argument. The frozen config.output_dir accepts an override for the CLI's
     # --output-dir flag; passing anything here would put the destination one
@@ -114,6 +181,24 @@ def init() -> None:
         pass
 
     _max_concurrent = _positive_int(ENV_MAX_CONCURRENT, _DEFAULT_MAX_CONCURRENT)
+    _max_pending = _positive_int(ENV_MAX_PENDING, _DEFAULT_MAX_PENDING)
+    _job_timeout = _positive_int(ENV_JOB_TIMEOUT, _DEFAULT_JOB_TIMEOUT)
+    _rate_limit = _positive_int(ENV_RATE_LIMIT, _DEFAULT_RATE_LIMIT)
+    _rate_window = _positive_int(ENV_RATE_WINDOW, _DEFAULT_RATE_WINDOW)
+    _sweep_interval = _positive_int(ENV_SWEEP_INTERVAL, _DEFAULT_SWEEP_INTERVAL)
+
+    # Zero is a valid instruction here and nowhere else above -- see
+    # _non_negative_int.
+    _min_free_bytes = _non_negative_int(ENV_MIN_FREE_BYTES, _DEFAULT_MIN_FREE_BYTES)
+
+    # Neither the rate buckets nor the wedged-worker set survives init().
+    # A bucket left over from a previous configuration would be measured
+    # against the new window, and a wedged count is a statement about threads in
+    # this process's pool -- which init() has just replaced.
+    with _rate_lock:
+        _rate_buckets.clear()
+    with _lock:
+        _watchdog_failed.clear()
 
     # max_workers IS the concurrency cap (FR-015). There is deliberately no
     # semaphore: the pool's queue already draws the waiting/running line, and a
@@ -202,6 +287,15 @@ class Job:
     total_bytes: int | None = None
     files: tuple[Path, ...] = ()
     failure_code: str | None = None
+    # Set by the progress callback immediately before it raises, and read by
+    # the worker's exception handler to tell a deadline abort apart from any
+    # other failure. A boolean carries no free text, so it does not weaken the
+    # guarantee above -- but it IS a new field, so it is also a new row in
+    # data-model.md, which is where that guarantee is audited.
+    #
+    # Not persisted: failure_code already carries the outcome to disk, and this
+    # is only a signal between two parts of one process.
+    timed_out: bool = False
 
 
 def _enter_terminal(
@@ -347,6 +441,23 @@ def get(handle: str) -> Job | None:
 # The operator's audit trail (FR-031, FR-032)
 # --------------------------------------------------------------------------
 
+# The outcome vocabulary of data-model.md's SubmissionRecord. The three refusal
+# outcomes -- rate_limited, disk_low, at_capacity -- are the same constants
+# submit() returns as `problem` codes, deliberately: one string means one thing
+# whether it is being logged for the operator or mapped to a status code, and
+# two parallel vocabularies would drift.
+#
+# Whether canonical_url is recorded depends on where in submit() the refusal
+# happened, and the split is not arbitrary:
+#
+#   rejected_url, rate_limited -> canonical_url is None. Both are decided
+#       before or at validation, so the URL is still unvalidated caller-supplied
+#       text at that moment, and FR-032 forbids storing it.
+#   disk_low, at_capacity      -> canonical_url IS recorded. Validation has
+#       passed by then, so there is a canonical form to write.
+#
+# It looks like an inconsistency until you know that, which is why it is
+# written here.
 ACCEPTED = "accepted"
 DEDUPLICATED = "deduplicated"
 REJECTED_URL = "rejected_url"
@@ -394,12 +505,102 @@ def _audit(outcome: str, *, client_address: str, canonical_url: str | None, hand
 # --------------------------------------------------------------------------
 
 
+# Why submit() returns a record rather than raising
+# ------------------------------------------------
+# Four things can refuse a submission: an invalid URL, the rate limit, the free
+# disk floor, and the pending cap. Principle VI forbids a custom exception
+# hierarchy, and ValueError is already spoken for by the URL -- so raising
+# cannot distinguish them without inventing exactly what the principle rules
+# out.
+#
+# Returning "refused, and why" as a frozen record is what this codebase already
+# does twice: DownloadOutcome in the frozen module, and FileResult below. A
+# third idiom would be the inconsistent choice, not the conservative one.
+INVALID_URL = "invalid_url"
+RATE_LIMITED = "rate_limited"
+DISK_LOW = "disk_low"
+AT_CAPACITY = "at_capacity"
+
+
+def _rate_limited(client_address: str, moment: float) -> int | None:
+    """Seconds until this address may submit again, or None if it may now.
+
+    Sliding window over a deque of submission timestamps (research D9). Old
+    entries are evicted from the left before the length is compared, so the
+    window really slides rather than resetting on a fixed boundary -- a fixed
+    boundary lets a caller spend a full allowance either side of it and get
+    double the limit in an instant.
+
+    The returned figure is computed entirely from server-side state: the oldest
+    timestamp still in the window plus the window length. It is the only number
+    this module has ever handed the transport to show a caller, and it is safe
+    under FR-029 for that reason -- it is arithmetic on our own clock, not
+    anything derived from a request.
+    """
+    with _rate_lock:
+        bucket = _rate_buckets.setdefault(client_address, deque())
+        cutoff = moment - _rate_window
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+
+        if len(bucket) >= _rate_limit:
+            return max(1, math.ceil(bucket[0] + _rate_window - moment))
+
+        bucket.append(moment)
+        return None
+
+
+@dataclass(frozen=True)
+class SubmitResult:
+    """The outcome of one submission attempt.
+
+    Exactly one of `job` and `problem` is set. `retry_after` is a count of
+    seconds and is populated only for a rate-limited refusal; it is computed
+    entirely from server-side state, which is what makes it safe for api.py to
+    put in front of a caller (FR-029).
+    """
+
+    job: Job | None
+    problem: str | None = None
+    retry_after: int | None = None
+
+
+def _free_bytes(measure: Callable[[Path], int] = lambda path: shutil.disk_usage(path).free) -> int | None:
+    """Free space on the output volume, or None when the guard cannot apply.
+
+    None means "do not refuse anything", and it is returned for two different
+    reasons that deserve the same treatment:
+
+    * the operator set the threshold to 0, disabling the guard deliberately;
+    * the measurement itself failed.
+
+    The second one FAILS OPEN, with a logged warning. A service that stops
+    accepting work because it cannot read its own free space has converted a
+    monitoring problem into an outage, which is a worse failure than the one the
+    guard exists to prevent (FR-018 guards against filling the disk, not against
+    uncertainty about it).
+
+    `measure` is the same kind of defaulted seam as `download` -- it lets a test
+    state a free-space figure instead of filling a real volume.
+    """
+    if _min_free_bytes <= 0:
+        return None
+    assert _output_dir is not None  # narrowed by _require_init in submit()
+    try:
+        return measure(_output_dir)
+    except OSError:
+        _log.warning("could not measure free space on the output volume", exc_info=True)
+        return None
+
+
 def submit(
     url: str,
     client_address: str,
     *,
     download: Callable[..., DownloadOutcome] = download_post,
-) -> Job:
+    now: Callable[[], float] = time.time,
+    free_space: Callable[[], int | None] = _free_bytes,
+) -> SubmitResult:
     """Accept a URL and return immediately with a job. Does not download.
 
     `download` is a test seam and nothing else: tests/test_jobs.py passes a
@@ -407,12 +608,36 @@ def submit(
     (Principle II permits fakes, not mocking frameworks). It is keyword-only and
     api.py never passes it. It MUST NOT be wired to anything a caller supplies.
 
-    Raises ValueError for a rejected URL, which api.py maps to 400. No job is
-    created and no network request is made on that path (FR-003).
+    `now` and `free_space` are the same kind of seam for the clock and for the
+    disk, so the rate limit can be tested by moving time rather than waiting
+    through it, and the disk guard by stating a figure rather than filling a
+    volume. api.py passes none of the three.
+
+    Never raises for a refusal. An invalid URL comes back as
+    SubmitResult(None, "invalid_url"); no job is created and no network request
+    is made on that path (FR-003).
     """
     _require_init()
+    moment = now()
 
-    # The Principle V gate, first, before anything is created or reserved. The
+    # Checked BEFORE validation, and that ordering is deliberate.
+    #
+    # FR-019 says "how many jobs a caller may create", which read literally
+    # would leave an invalid URL uncounted. That is the cheapest abuse route
+    # available: a validation pass and an audit append per request, free
+    # forever. A limiter that only counts successes protects the service from
+    # its well-behaved users. Research D9 says "on each submission", and this is
+    # the submission reading.
+    #
+    # The cost is real and accepted: ten typos spend the default hourly
+    # allowance. Moving this call below parse_post_url is the one-line change
+    # that inverts it -- do that deliberately or not at all.
+    retry_after = _rate_limited(client_address, moment)
+    if retry_after is not None:
+        _audit(RATE_LIMITED, client_address=client_address, canonical_url=None, handle=None)
+        return SubmitResult(None, RATE_LIMITED, retry_after)
+
+    # The Principle V gate, before anything is created or reserved. The
     # frozen parse_post_url is the only allowlist in the service; this adds no
     # second validation path and no bypass. download_post validates again
     # internally, which is the gate no caller can skip -- this call does not
@@ -420,32 +645,67 @@ def submit(
     try:
         reference = parse_post_url(url)
     except ValueError:
+        # Logged in full: it names the URL and the accepted hosts, which is
+        # useful to an operator and forbidden to a caller (FR-005).
+        _log.info("rejected submission from %s", client_address, exc_info=True)
         _audit(REJECTED_URL, client_address=client_address, canonical_url=None, handle=None)
-        raise
+        return SubmitResult(None, INVALID_URL)
 
+    # Read outside _lock, applied inside it. disk_usage is a syscall, and
+    # holding the registry lock across it would block every status poll and
+    # every worker transition on the filesystem. The reading is at most
+    # microseconds stale against a threshold measured in gigabytes.
+    free_bytes = free_space()
+
+    refusal: str | None = None
+    job: Job | None = None
     with _lock:
-        # Deduplicate on the canonical URL rather than the post id, because
+        # One pass over the registry answers both questions. Deduplication is
+        # keyed on the canonical URL rather than the post id, because
         # canonical_url already distinguishes /video/1 from the bare post URL
         # and those produce different files (FR-017, ADR-0001). Check and insert
         # are inside one lock, or five simultaneous submissions of one post
         # would start five downloads (SC-007).
+        duplicate_of: Job | None = None
+        pending = 0
         for existing in _registry.values():
-            if existing.canonical_url == reference.canonical_url and existing.state in (
-                WAITING,
-                RUNNING,
+            if existing.state == WAITING:
+                pending += 1
+            if (
+                duplicate_of is None
+                and existing.canonical_url == reference.canonical_url
+                and existing.state in (WAITING, RUNNING)
             ):
                 duplicate_of = existing
-                break
-        else:
-            duplicate_of = None
 
         if duplicate_of is None:
-            job = Job(
-                handle=_mint_handle(),
-                canonical_url=reference.canonical_url,
-                client_address=client_address,
-            )
-            _registry[job.handle] = job
+            # Both guards apply ONLY on the create path. A deduplicated
+            # submission creates no job and consumes no disk, so refusing it for
+            # capacity would punish a caller for work the service had already
+            # decided to do.
+            if free_bytes is not None and free_bytes < _min_free_bytes:
+                refusal = DISK_LOW
+            elif pending >= _max_pending:
+                refusal = AT_CAPACITY
+            else:
+                job = Job(
+                    handle=_mint_handle(),
+                    canonical_url=reference.canonical_url,
+                    client_address=client_address,
+                )
+                _registry[job.handle] = job
+
+    if refusal is not None:
+        # The URL passed validation here, so it is recorded -- unlike the
+        # rate-limited and rejected paths above, where it is still unvalidated
+        # caller text and FR-032 forbids storing it.
+        _audit(
+            refusal,
+            client_address=client_address,
+            canonical_url=reference.canonical_url,
+            handle=None,
+        )
+        return SubmitResult(None, refusal)
 
     if duplicate_of is not None:
         # The caller gets a usable handle for work already underway (FR-016).
@@ -456,8 +716,9 @@ def submit(
             canonical_url=duplicate_of.canonical_url,
             handle=duplicate_of.handle,
         )
-        return duplicate_of
+        return SubmitResult(duplicate_of)
 
+    assert job is not None  # the only remaining branch
     persist(job)
     _audit(
         ACCEPTED,
@@ -467,8 +728,11 @@ def submit(
     )
 
     assert _executor is not None  # narrowed by _require_init
-    _executor.submit(_run_job, job, download)
-    return job
+    # `now` travels with the job to its worker, so a test can drive the deadline
+    # through the real path -- submit, worker, progress hook -- instead of
+    # calling the hook directly and leaving the wiring between them unverified.
+    _executor.submit(_run_job, job, download, now)
+    return SubmitResult(job)
 
 
 # --------------------------------------------------------------------------
@@ -476,18 +740,34 @@ def submit(
 # --------------------------------------------------------------------------
 
 
-def _make_progress_hook(job: Job) -> Callable[[dict], None]:
-    """Update the job's progress from yt-dlp's status dict. Memory only.
+def _make_progress_hook(
+    job: Job, now: Callable[[], float] = time.time
+) -> Callable[[dict], None]:
+    """Update the job's progress, and enforce the deadline (FR-020).
 
     Never persists (research D3). Best-effort by requirement: a missing total is
     normal for HLS, and for a multi-video post the figures restart per video, so
     FR-008 makes progress advisory rather than monotonic.
 
-    The job time limit will be enforced from inside this callback in a later
-    phase. It is not enforced here yet.
+    The deadline lives here because this callback is the only thing we can get
+    inside a running download without touching the frozen module. Raising from
+    it aborts the transfer, verified two ways (research D4.1): _hook_progress
+    calls each hook with no try/except (yt_dlp/downloader/common.py:488-494), so
+    the exception propagates; and even if some layer absorbed it, download_post
+    raises on a non-zero retcode (downloader.py:511-512). Both paths run the
+    finally that removes the temp directory, so no cleanup is needed here.
     """
 
     def hook(status: dict) -> None:
+        if job.started_at is not None and now() > job.started_at + _job_timeout:
+            # RuntimeError specifically. Principle VI names it as an approved
+            # built-in, and -- the part that is not guessable -- it must NOT
+            # subclass OSError or any network exception, or yt-dlp's handler at
+            # YoutubeDL.py:3597-3602 would catch it and merely report an error
+            # instead of letting the download abort.
+            job.timed_out = True
+            raise RuntimeError("job time limit exceeded")
+
         if status.get("status") != "downloading":
             return
         job.downloaded_bytes = status.get("downloaded_bytes")
@@ -510,36 +790,61 @@ def _make_warning_hook(job: Job) -> Callable[[str], None]:
     return hook
 
 
-def _run_job(job: Job, download: Callable[..., DownloadOutcome]) -> None:
+def _run_job(
+    job: Job,
+    download: Callable[..., DownloadOutcome],
+    now: Callable[[], float] = time.time,
+) -> None:
     """Run one download to completion. Executes on a pool worker, never on a request."""
     with _lock:
         if job.state != WAITING:
             return
         job.state = RUNNING
-        job.started_at = time.time()
+        # The deadline runs from here, not from created_at, so queue time is not
+        # charged against the job.
+        job.started_at = now()
     persist(job)
 
     assert _output_dir is not None  # narrowed by _require_init in submit()
     try:
-        outcome = download(
-            job.canonical_url,
-            _output_dir,
-            progress=_make_progress_hook(job),
-            on_warning=_make_warning_hook(job),
-        )
-    except ValueError:
-        # download_post raises this for metadata it refuses to guess at, and
-        # build_target raises it naming both the candidate path and the output
-        # root (validation.py:186). Logged in full, never carried forward.
-        _log.exception("job %s: download raised ValueError", job.handle)
-        _finish(job, FAILED, failure_code=UNCLASSIFIED)
-        return
-    except BaseException:
-        _log.exception("job %s: download raised unexpectedly", job.handle)
-        _finish(job, FAILED, failure_code=UNCLASSIFIED)
-        return
+        try:
+            outcome = download(
+                job.canonical_url,
+                _output_dir,
+                progress=_make_progress_hook(job, now),
+                on_warning=_make_warning_hook(job),
+            )
+        except ValueError:
+            # download_post raises this for metadata it refuses to guess at, and
+            # build_target raises it naming both the candidate path and the
+            # output root (validation.py:186). Logged in full, never carried
+            # forward.
+            _log.exception("job %s: download raised ValueError", job.handle)
+            _finish(job, FAILED, failure_code=_abort_code(job))
+            return
+        except BaseException:
+            _log.exception("job %s: download raised unexpectedly", job.handle)
+            _finish(job, FAILED, failure_code=_abort_code(job))
+            return
 
-    _record_outcome(job, outcome)
+        _record_outcome(job, outcome)
+    finally:
+        # Every return path clears the wedged mark, so the health count means
+        # "started, given up on, and still has not come back" -- and nothing
+        # else. The outer try exists for exactly this: a worker that returns
+        # late, after the watchdog already ruled, must still stop being counted.
+        _clear_wedged(job.handle)
+
+
+def _abort_code(job: Job) -> str:
+    """Which code an aborted download earns.
+
+    The deadline is identified by the job's own flag, never by reading the
+    exception's text: download_post wraps failures as
+    f"download failed for video {position}: {detail}" (downloader.py:534), and
+    no classifier should have to reverse-engineer that (research D4).
+    """
+    return TIME_LIMIT if job.timed_out else UNCLASSIFIED
 
 
 def _finish(
@@ -665,6 +970,134 @@ def _record_outcome(job: Job, outcome: DownloadOutcome) -> None:
 
     _log.info("job %s failed: %s", job.handle, outcome.message)
     _finish(job, FAILED, failure_code=_classify(outcome.message))
+
+
+# --------------------------------------------------------------------------
+# The periodic sweep
+#
+# Synchronous by rule. The schedule that drives it is one layer up in api.py,
+# because a loop and a sleep are transport-lifecycle concerns and because this
+# module may not import asyncio -- tests/test_jobs.py walks these imports and
+# fails on it. What runs is here; when it runs is not.
+# --------------------------------------------------------------------------
+
+# _watchdog_failed is declared with the other process state near init(), which
+# clears it. A hung ffmpeg merge fires no hook and Python threads cannot be
+# killed, so the thread stays occupied until the process restarts -- and the
+# count going to zero on restart is therefore correct rather than a reset.
+
+
+def _clear_wedged(handle: str) -> None:
+    with _lock:
+        _watchdog_failed.discard(handle)
+
+
+def _run_watchdog(moment: float) -> None:
+    """Fail every running job past its deadline (FR-020, research D4).
+
+    This decouples the JOB's state from the THREAD's state. The progress hook
+    aborts a download that is still reporting; a download wedged in the ffmpeg
+    merge reports nothing at all, and without this its caller would poll a
+    "running" job forever. The caller is freed here even though the worker
+    cannot be.
+    """
+    with _lock:
+        overdue = [
+            job
+            for job in _registry.values()
+            if job.state == RUNNING
+            and job.started_at is not None
+            and moment > job.started_at + _job_timeout
+        ]
+
+    for job in overdue:
+        with _lock:
+            applied = _enter_terminal(job, FAILED, failure_code=TIME_LIMIT)
+            if applied:
+                _watchdog_failed.add(job.handle)
+        if applied:
+            persist(job)
+            # Deliberately greppable. Research D4 names an operator-visible
+            # warning as the chosen mitigation for the wedged-worker gap, and a
+            # warning nobody can search for is not one.
+            _log.warning(
+                "xvd-wedged-worker: job %s passed its time limit and was failed; "
+                "its worker thread has not returned and one download slot is "
+                "unavailable until restart",
+                job.handle,
+            )
+
+
+def _prune_rate_buckets(moment: float) -> None:
+    """Drop buckets that have gone empty, so one-off callers cannot grow the dict.
+
+    Without this the address map is a slow memory leak on a public service:
+    every address that ever submitted keeps an entry for the life of the
+    process (research D9).
+    """
+    cutoff = moment - _rate_window
+    with _rate_lock:
+        for address in list(_rate_buckets):
+            bucket = _rate_buckets[address]
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if not bucket:
+                del _rate_buckets[address]
+
+
+def sweep(*, now: Callable[[], float] = time.time) -> None:
+    """One maintenance pass. Safe to call at any time; does nothing if idle.
+
+    Order matters and is not alphabetical:
+
+    1. the deadline watchdog, so an overdue job is failed before anything else
+       reasons about it;
+    2. retention, so finished work older than the retention period is expired
+       and its file deleted;
+    3. the rate-bucket prune, which is pure bookkeeping and can happen last.
+
+    Retention is inserted at step 2 rather than appended, because expiring a job
+    the watchdog is about to fail in the same pass would be deciding an outcome
+    twice.
+
+    `now` is the clock seam, so an entire retention period can pass inside a
+    test without any of it elapsing.
+    """
+    _require_init()
+    moment = now()
+    _run_watchdog(moment)
+    _prune_rate_buckets(moment)
+
+
+def sweep_interval() -> int:
+    """How often the sweep should run, in seconds.
+
+    A function rather than the module global itself, because api.py starts its
+    loop after init() has run and reading the name at import time would capture
+    the default instead of the operator's setting.
+    """
+    return _sweep_interval
+
+
+def health() -> dict:
+    """Aggregate counts for the operator. No handles, no URLs, no addresses.
+
+    This endpoint is unauthenticated and reachable by anyone, so it may carry
+    totals and nothing else. Counted here rather than in api.py because walking
+    the registry is domain iteration, which does not belong in a request
+    handler.
+    """
+    with _lock:
+        running = sum(1 for job in _registry.values() if job.state == RUNNING)
+        waiting = sum(1 for job in _registry.values() if job.state == WAITING)
+        wedged = len(_watchdog_failed)
+
+    return {
+        "status": "degraded" if wedged else "ok",
+        "running": running,
+        "waiting": waiting,
+        "wedged_workers": wedged,
+    }
 
 
 # --------------------------------------------------------------------------

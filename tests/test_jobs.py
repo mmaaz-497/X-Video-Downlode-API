@@ -60,6 +60,21 @@ def _stub(*paths: Path, status: str = "downloaded", message: str = "ok"):
     return download
 
 
+def _accept(service, url=BARE_URL, address="203.0.113.7", **kwargs):
+    """Submit, assert the submission was accepted, and return the job.
+
+    submit() returns a SubmitResult so that four different refusals can cross
+    the service boundary without a custom exception hierarchy. Most tests here
+    are about what happens *after* acceptance, and this helper says so at each
+    call site -- which the bare `.job` never did.
+    """
+    kwargs.setdefault("download", _stub())
+    result = service.submit(url, address, **kwargs)
+    assert result.problem is None, f"submission refused: {result.problem}"
+    assert result.job is not None
+    return result.job
+
+
 def _finished(service, tmp_path, count: int = 1):
     """Run a job to completion with `count` real files on disk."""
     files = []
@@ -67,7 +82,7 @@ def _finished(service, tmp_path, count: int = 1):
         path = tmp_path / "out" / f"video-{index}.mp4"
         path.write_bytes(b"not really a video")
         files.append(path)
-    job = service.submit(BARE_URL, "203.0.113.7", download=_stub(*files))
+    job = _accept(service, download=_stub(*files))
     _await_terminal(job)
     return job, files
 
@@ -102,8 +117,8 @@ def test_handles_are_unique():
 
 def test_handle_is_not_derived_from_anything(service):
     """Two jobs for different posts must share no structure (FR-027)."""
-    first = service.submit(BARE_URL, "203.0.113.7", download=_stub())
-    second = service.submit("https://x.com/other/status/20", "203.0.113.7", download=_stub())
+    first = _accept(service)
+    second = _accept(service, "https://x.com/other/status/20")
     assert first.handle != second.handle
     assert POST_ID not in first.handle
 
@@ -124,15 +139,15 @@ def test_handle_is_not_derived_from_anything(service):
 )
 def test_url_variants_deduplicate_to_one_job(service, variant):
     """Host, query string, trailing slash, and handle-less form are one post."""
-    first = service.submit(BARE_URL, "203.0.113.7", download=_stub())
-    again = service.submit(variant, "198.51.100.4", download=_stub())
+    first = _accept(service)
+    again = _accept(service, variant, "198.51.100.4")
     assert again.handle == first.handle
 
 
 def test_indexed_url_is_a_different_job(service):
     """/video/1 names one media item, not the post -- and yields a different file."""
-    bare = service.submit(BARE_URL, "203.0.113.7", download=_stub())
-    indexed = service.submit(f"{BARE_URL}/video/1", "203.0.113.7", download=_stub())
+    bare = _accept(service)
+    indexed = _accept(service, f"{BARE_URL}/video/1")
     assert indexed.handle != bare.handle
     assert indexed.canonical_url.endswith("/video/1")
 
@@ -144,7 +159,7 @@ def test_finished_job_does_not_absorb_a_new_submission(service, tmp_path):
     must start its own job rather than be handed a stale one.
     """
     first, _ = _finished(service, tmp_path)
-    again = service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    again = _accept(service)
     assert again.handle != first.handle
 
 
@@ -160,20 +175,21 @@ def test_finished_job_does_not_absorb_a_new_submission(service, tmp_path):
         "   ",
     ],
 )
-def test_rejected_url_raises_and_creates_no_job(service, url):
+def test_rejected_url_creates_no_job(service, url):
     """FR-003: no job, no record, nothing reserved.
 
     An audit line IS written -- that is FR-031, and a run of rejections from one
     address is the pattern worth seeing. Nothing in the *jobs* directory.
     """
-    with pytest.raises(ValueError):
-        service.submit(url, "203.0.113.7", download=_stub())
+    result = service.submit(url, "203.0.113.7", download=_stub())
+    assert result.problem == jobs.INVALID_URL
+    assert result.job is None
     assert service._registry == {}
     assert list((service._jobs_dir).iterdir()) == []
 
 
 def test_submission_persists_a_record(service):
-    job = service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    job = _accept(service)
     assert (service._jobs_dir / f"{job.handle}.json").is_file()
 
 
@@ -194,16 +210,15 @@ def test_skipped_is_a_success(service, tmp_path):
     """Feature 001 returns "skipped" when the file is already on disk (FR-016)."""
     path = tmp_path / "out" / "already-there.mp4"
     path.write_bytes(b"x")
-    job = service.submit(BARE_URL, "203.0.113.7", download=_stub(path, status="skipped"))
+    job = _accept(service, download=_stub(path, status="skipped"))
     _await_terminal(job)
     assert job.state == jobs.FINISHED
 
 
 def test_failed_outcome_records_a_code_and_no_text(service):
     """The record must carry a code and must have nowhere to put the message."""
-    job = service.submit(
-        BARE_URL,
-        "203.0.113.7",
+    job = _accept(
+        service,
         download=_stub(status="failed", message="this post has no video in it."),
     )
     _await_terminal(job)
@@ -218,7 +233,7 @@ def test_download_raising_does_not_wedge_the_job(service):
     def exploding(url, output_dir, progress=None, on_warning=None):
         raise ValueError("refusing to write outside the output directory: /etc/passwd")
 
-    job = service.submit(BARE_URL, "203.0.113.7", download=exploding)
+    job = _accept(service, download=exploding)
     _await_terminal(job)
     assert job.state == jobs.FAILED
     assert job.failure_code == jobs.UNCLASSIFIED
@@ -240,7 +255,7 @@ def test_terminal_state_is_never_left(service, tmp_path):
 
 def test_progress_updates_memory_but_not_disk(service, tmp_path):
     """Progress must never trigger a write (research D3)."""
-    job = service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    job = _accept(service)
     _await_terminal(job)
     hook = jobs._make_progress_hook(job)
     hook({"status": "downloading", "downloaded_bytes": 512, "total_bytes": 2048})
@@ -251,7 +266,7 @@ def test_progress_updates_memory_but_not_disk(service, tmp_path):
 
 def test_progress_tolerates_a_missing_total(service):
     """HLS reports no total_bytes; FR-008 makes progress advisory."""
-    job = service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    job = _accept(service)
     hook = jobs._make_progress_hook(job)
     hook({"status": "downloading", "downloaded_bytes": 100})
     assert job.total_bytes is None
@@ -296,7 +311,7 @@ def test_out_of_range_index_is_refused_not_clamped(service, tmp_path, index):
 
 
 def test_unfinished_job_yields_no_file(service):
-    job = service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    job = _accept(service)
     job.state = jobs.WAITING  # whatever the worker did, ask as if still queued
     result = service.file_for(job)
     assert result.problem == "not_ready"
@@ -304,7 +319,7 @@ def test_unfinished_job_yields_no_file(service):
 
 
 def test_failed_job_yields_no_file(service):
-    job = service.submit(BARE_URL, "203.0.113.7", download=_stub(status="failed"))
+    job = _accept(service, download=_stub(status="failed"))
     _await_terminal(job)
     result = service.file_for(job)
     assert result.problem == jobs.FAILED
@@ -344,7 +359,7 @@ def _audit_lines(service):
 
 
 def test_acceptance_is_audited(service):
-    job = service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    job = _accept(service)
     (line,) = _audit_lines(service)
     assert line["outcome"] == "accepted"
     assert line["client_address"] == "203.0.113.7"
@@ -354,8 +369,8 @@ def test_acceptance_is_audited(service):
 
 
 def test_deduplication_is_audited_separately(service):
-    service.submit(BARE_URL, "203.0.113.7", download=_stub())
-    service.submit(BARE_URL, "198.51.100.4", download=_stub())
+    _accept(service)
+    _accept(service, address="198.51.100.4")
     outcomes = [line["outcome"] for line in _audit_lines(service)]
     assert outcomes == ["accepted", "deduplicated"]
     assert _audit_lines(service)[1]["client_address"] == "198.51.100.4"
@@ -369,8 +384,7 @@ def test_rejection_is_audited_without_the_submitted_text(service):
     in a terminal.
     """
     hostile = "https://evil.com/\x1b]0;pwned\x07/status/20"
-    with pytest.raises(ValueError):
-        service.submit(hostile, "203.0.113.7", download=_stub())
+    assert service.submit(hostile, "203.0.113.7", download=_stub()).problem == jobs.INVALID_URL
 
     (line,) = _audit_lines(service)
     assert line["outcome"] == "rejected_url"
@@ -500,6 +514,403 @@ def test_get_never_touches_the_filesystem(service, monkeypatch):
 
     monkeypatch.setattr("builtins.open", forbidden)
     assert service.get("../../../etc/passwd") is None
+
+
+# --------------------------------------------------------------------------
+# Resource protection (US4: FR-015, FR-018, FR-019, FR-020)
+#
+# Not one time.sleep in this section. The clock and the free-space reading are
+# both defaulted parameters on submit(), so an hour passes by handing in a
+# different lambda. A suite that waited through a rate-limit window would take
+# an hour to tell you the window works.
+# --------------------------------------------------------------------------
+
+
+def _clock(start: float = 1_000_000.0):
+    """A clock a test can wind forward."""
+
+    class Clock:
+        now = start
+
+        def __call__(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    return Clock()
+
+
+def test_rate_limit_refuses_beyond_the_allowance(service, monkeypatch):
+    monkeypatch.setenv("XVD_RATE_LIMIT", "3")
+    service.init()
+    clock = _clock()
+
+    for index in range(3):
+        result = service.submit(
+            f"{BARE_URL}{index}", "203.0.113.7", download=_stub(), now=clock
+        )
+        assert result.problem is None
+
+    refused = service.submit(f"{BARE_URL}9", "203.0.113.7", download=_stub(), now=clock)
+    assert refused.problem == jobs.RATE_LIMITED
+    assert refused.job is None
+
+
+def test_rate_limit_reports_a_usable_retry_after(service, monkeypatch):
+    """FR-019: a refusal must state when the caller may retry."""
+    monkeypatch.setenv("XVD_RATE_LIMIT", "1")
+    monkeypatch.setenv("XVD_RATE_WINDOW", "600")
+    service.init()
+    clock = _clock()
+
+    _accept(service, now=clock)
+    clock.advance(100)
+    refused = service.submit(BARE_URL, "203.0.113.7", download=_stub(), now=clock)
+
+    assert refused.problem == jobs.RATE_LIMITED
+    # 600 - 100 elapsed. An integer, positive, and never larger than the window.
+    assert refused.retry_after == 500
+    assert isinstance(refused.retry_after, int)
+
+
+def test_rate_limit_window_slides(service, monkeypatch):
+    """Past the window, the allowance returns -- without any real time passing."""
+    monkeypatch.setenv("XVD_RATE_LIMIT", "1")
+    monkeypatch.setenv("XVD_RATE_WINDOW", "600")
+    service.init()
+    clock = _clock()
+
+    _accept(service, now=clock)
+    assert service.submit(BARE_URL, "203.0.113.7", download=_stub(), now=clock).problem
+
+    clock.advance(601)
+    assert _accept(service, now=clock)
+
+
+def test_rate_limit_is_per_address(service, monkeypatch):
+    """One caller exhausting their allowance must not refuse everyone else."""
+    monkeypatch.setenv("XVD_RATE_LIMIT", "1")
+    service.init()
+    clock = _clock()
+
+    _accept(service, now=clock)
+    assert service.submit(
+        f"{BARE_URL}1", "203.0.113.7", download=_stub(), now=clock
+    ).problem == jobs.RATE_LIMITED
+    assert _accept(service, f"{BARE_URL}2", "198.51.100.4", now=clock)
+
+
+def test_rate_limit_counts_invalid_urls(service, monkeypatch):
+    """A deliberate deviation from FR-019's literal "jobs created" wording.
+
+    An uncounted invalid-URL path is the cheapest abuse route available: a
+    validation pass and an audit append per request, free forever. This test
+    exists so that inverting the decision is a failing test and a conversation,
+    not a silent drift.
+    """
+    monkeypatch.setenv("XVD_RATE_LIMIT", "2")
+    service.init()
+    clock = _clock()
+
+    assert service.submit(
+        "https://evil.com/a/status/20", "203.0.113.7", download=_stub(), now=clock
+    ).problem == jobs.INVALID_URL
+    assert service.submit(
+        "https://evil.com/b/status/20", "203.0.113.7", download=_stub(), now=clock
+    ).problem == jobs.INVALID_URL
+
+    # The allowance is spent, so a perfectly valid URL is now refused.
+    assert service.submit(
+        BARE_URL, "203.0.113.7", download=_stub(), now=clock
+    ).problem == jobs.RATE_LIMITED
+
+
+def test_rate_limit_counts_deduplicated_submissions(service, monkeypatch):
+    """Same decision, the other case it changes."""
+    monkeypatch.setenv("XVD_RATE_LIMIT", "2")
+    service.init()
+    clock = _clock()
+
+    _accept(service, now=clock)
+    _accept(service, now=clock)  # deduplicated onto the first, still counted
+
+    assert service.submit(
+        f"{BARE_URL}9", "203.0.113.7", download=_stub(), now=clock
+    ).problem == jobs.RATE_LIMITED
+
+
+def test_rate_limited_submission_is_audited_without_the_url(service, monkeypatch):
+    """FR-032: the check runs before validation, so the URL is still caller text."""
+    monkeypatch.setenv("XVD_RATE_LIMIT", "1")
+    service.init()
+    clock = _clock()
+
+    _accept(service, now=clock)
+    service.submit(BARE_URL, "203.0.113.7", download=_stub(), now=clock)
+
+    line = _audit_lines(service)[-1]
+    assert line["outcome"] == "rate_limited"
+    assert line["client_address"] == "203.0.113.7"
+    assert line["canonical_url"] is None
+    assert line["handle"] is None
+
+
+def test_rate_buckets_are_pruned_by_the_sweep(service):
+    """Otherwise the address map is a slow leak on a public service."""
+    clock = _clock()
+    _accept(service, now=clock)
+    assert "203.0.113.7" in service._rate_buckets
+
+    clock.advance(service._rate_window + 1)
+    service.sweep(now=clock)
+    assert service._rate_buckets == {}
+
+
+# --- The free-disk guard (FR-018) -----------------------------------------
+
+
+def test_disk_below_threshold_refuses_and_creates_nothing(service):
+    result = service.submit(
+        BARE_URL, "203.0.113.7", download=_stub(), free_space=lambda: 1024
+    )
+    assert result.problem == jobs.DISK_LOW
+    assert result.job is None
+    assert service._registry == {}
+    assert list(service._jobs_dir.iterdir()) == []
+
+
+def test_disk_refusal_is_audited_with_the_url(service):
+    """Unlike a rate-limited refusal: validation has passed, so there is a
+    canonical form to record."""
+    service.submit(BARE_URL, "203.0.113.7", download=_stub(), free_space=lambda: 1024)
+    (line,) = _audit_lines(service)
+    assert line["outcome"] == "disk_low"
+    assert line["canonical_url"].endswith(POST_ID)
+    assert line["handle"] is None
+
+
+def test_disk_guard_is_disabled_by_a_zero_threshold(service, monkeypatch):
+    monkeypatch.setenv("XVD_MIN_FREE_BYTES", "0")
+    service.init()
+    assert service._free_bytes() is None
+
+
+def test_disk_measurement_failure_fails_open(service):
+    """A monitoring problem must not become an outage.
+
+    If the volume cannot be measured, the guard declines to decide rather than
+    refusing every submission -- FR-018 guards against filling the disk, not
+    against uncertainty about it.
+    """
+
+    def unmeasurable(_path):
+        raise OSError("no such device")
+
+    assert service._free_bytes(unmeasurable) is None
+    assert _accept(service, free_space=lambda: service._free_bytes(unmeasurable))
+
+
+# --- The pending-depth cap (amended FR-015) --------------------------------
+
+
+def test_pending_cap_refuses_beyond_the_depth(service, monkeypatch):
+    monkeypatch.setenv("XVD_MAX_PENDING", "2")
+    service.init()
+
+    # Jobs parked in `waiting` without a worker to pick them up.
+    for index in range(2):
+        job = jobs.Job(
+            handle=jobs._mint_handle(),
+            canonical_url=f"https://x.com/i/web/status/{index}",
+            client_address="203.0.113.7",
+        )
+        service._registry[job.handle] = job
+
+    result = service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    assert result.problem == jobs.AT_CAPACITY
+    assert result.job is None
+
+
+def test_deduplicated_submission_is_accepted_at_capacity(service, monkeypatch):
+    """The cap protects against NEW work. A dedup hit creates none.
+
+    Refusing it would punish a caller for work the service had already decided
+    to do, and would hand them nothing when a usable handle already exists.
+    """
+    monkeypatch.setenv("XVD_MAX_PENDING", "1")
+    service.init()
+
+    existing = jobs.Job(
+        handle=jobs._mint_handle(),
+        canonical_url=f"https://x.com/i/web/status/{POST_ID}",
+        client_address="203.0.113.7",
+    )
+    service._registry[existing.handle] = existing
+
+    result = service.submit(BARE_URL, "198.51.100.4", download=_stub())
+    assert result.problem is None
+    assert result.job is existing
+
+
+def test_capacity_refusal_is_audited(service, monkeypatch):
+    monkeypatch.setenv("XVD_MAX_PENDING", "1")
+    service.init()
+    parked = jobs.Job(
+        handle=jobs._mint_handle(),
+        canonical_url="https://x.com/i/web/status/1",
+        client_address="203.0.113.7",
+    )
+    service._registry[parked.handle] = parked
+
+    service.submit(BARE_URL, "203.0.113.7", download=_stub())
+    (line,) = _audit_lines(service)
+    assert line["outcome"] == "at_capacity"
+    assert line["canonical_url"] is not None
+
+
+# --- The job time limit and the watchdog (FR-020) --------------------------
+
+
+def test_deadline_raises_from_the_progress_hook(service, monkeypatch):
+    """The download is aborted from inside, which is the only lever the frozen
+    boundary offers (research D4)."""
+    monkeypatch.setenv("XVD_JOB_TIMEOUT", "60")
+    service.init()
+    clock = _clock()
+
+    def slow(url, output_dir, progress=None, on_warning=None):
+        progress({"status": "downloading", "downloaded_bytes": 10, "total_bytes": 100})
+        clock.advance(61)
+        progress({"status": "downloading", "downloaded_bytes": 20, "total_bytes": 100})
+        raise AssertionError("the hook should have aborted this download")
+
+    job = _accept(service, download=slow, now=clock)
+    _await_terminal(job)
+    assert job.state == jobs.FAILED
+    assert job.failure_code == jobs.TIME_LIMIT
+
+
+def test_deadline_uses_its_own_flag_not_the_message(service, monkeypatch):
+    """download_post wraps text as "download failed for video N: ..." and no
+    classifier should have to reverse-engineer that."""
+    monkeypatch.setenv("XVD_JOB_TIMEOUT", "60")
+    service.init()
+    clock = _clock()
+    job = jobs.Job(handle="x", canonical_url=BARE_URL, client_address="203.0.113.7")
+    job.started_at = clock.now
+    hook = service._make_progress_hook(job, clock)
+
+    hook({"status": "downloading", "downloaded_bytes": 1})
+    assert job.timed_out is False
+
+    clock.advance(61)
+    with pytest.raises(RuntimeError):
+        hook({"status": "downloading", "downloaded_bytes": 2})
+    assert job.timed_out is True
+    assert service._abort_code(job) == jobs.TIME_LIMIT
+
+
+def test_deadline_error_is_not_an_oserror(service):
+    """It must not subclass OSError or a network error, or yt-dlp's handler at
+    YoutubeDL.py:3597 would swallow it instead of aborting."""
+    job = jobs.Job(handle="x", canonical_url=BARE_URL, client_address="203.0.113.7")
+    job.started_at = 0.0
+    hook = service._make_progress_hook(job, lambda: 1e12)
+    with pytest.raises(RuntimeError) as caught:
+        hook({"status": "downloading"})
+    assert not isinstance(caught.value, OSError)
+
+
+def test_watchdog_fails_a_job_whose_worker_never_reports(service, monkeypatch):
+    """The wedged-ffmpeg case: no hook fires, so nothing raises, and without the
+    watchdog the caller polls "running" forever."""
+    monkeypatch.setenv("XVD_JOB_TIMEOUT", "60")
+    service.init()
+    clock = _clock()
+
+    job = jobs.Job(handle=jobs._mint_handle(), canonical_url=BARE_URL, client_address="203.0.113.7")
+    job.state = jobs.RUNNING
+    job.started_at = clock.now
+    service._registry[job.handle] = job
+
+    clock.advance(61)
+    service.sweep(now=clock)
+
+    assert job.state == jobs.FAILED
+    assert job.failure_code == jobs.TIME_LIMIT
+
+
+def test_watchdog_leaves_a_job_inside_its_deadline_alone(service, monkeypatch):
+    monkeypatch.setenv("XVD_JOB_TIMEOUT", "600")
+    service.init()
+    clock = _clock()
+
+    job = jobs.Job(handle=jobs._mint_handle(), canonical_url=BARE_URL, client_address="203.0.113.7")
+    job.state = jobs.RUNNING
+    job.started_at = clock.now
+    service._registry[job.handle] = job
+
+    clock.advance(60)
+    service.sweep(now=clock)
+    assert job.state == jobs.RUNNING
+
+
+def test_a_late_worker_cannot_overwrite_the_watchdog(service, monkeypatch):
+    """The race T003's terminal guard was built for stops being hypothetical here."""
+    monkeypatch.setenv("XVD_JOB_TIMEOUT", "60")
+    service.init()
+    clock = _clock()
+
+    job = jobs.Job(handle=jobs._mint_handle(), canonical_url=BARE_URL, client_address="203.0.113.7")
+    job.state = jobs.RUNNING
+    job.started_at = clock.now
+    service._registry[job.handle] = job
+
+    clock.advance(61)
+    service.sweep(now=clock)
+
+    # The thread finally returns with a success it can no longer claim.
+    service._record_outcome(job, _outcome(Path("late.mp4")))
+    assert job.state == jobs.FAILED
+    assert job.failure_code == jobs.TIME_LIMIT
+    assert job.files == ()
+
+
+def test_wedged_worker_is_counted_until_the_thread_returns(service, monkeypatch):
+    """The accepted limitation of ADR-0002, made visible rather than mysterious."""
+    monkeypatch.setenv("XVD_JOB_TIMEOUT", "60")
+    service.init()
+    clock = _clock()
+
+    job = jobs.Job(handle=jobs._mint_handle(), canonical_url=BARE_URL, client_address="203.0.113.7")
+    job.state = jobs.RUNNING
+    job.started_at = clock.now
+    service._registry[job.handle] = job
+
+    assert service.health()["wedged_workers"] == 0
+
+    clock.advance(61)
+    service.sweep(now=clock)
+    assert service.health()["wedged_workers"] == 1
+    assert service.health()["status"] == "degraded"
+
+    service._clear_wedged(job.handle)
+    assert service.health()["wedged_workers"] == 0
+    assert service.health()["status"] == "ok"
+
+
+def test_health_reports_counts_and_nothing_identifying(service):
+    """Unauthenticated and reachable by anyone: totals only."""
+    job = _accept(service)
+    _await_terminal(job)
+    body = service.health()
+
+    assert set(body) == {"status", "running", "waiting", "wedged_workers"}
+    serialised = json.dumps(body)
+    assert job.handle not in serialised
+    assert "x.com" not in serialised
+    assert "203.0.113.7" not in serialised
 
 
 # --------------------------------------------------------------------------
