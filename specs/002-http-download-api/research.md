@@ -288,6 +288,20 @@ directory. Safe at start-up specifically because the service is single-process (
 nothing is downloading yet. Note the CLI could in principle be running concurrently; the sweep is
 therefore start-up-only and never periodic, so it cannot delete a live CLI download's temp directory.
 
+> **Corrected 2026-08-15 while planning US6.** The final clause above does not follow. Being
+> start-up-only limits *how often* the sweep runs; it does nothing about a CLI download being in
+> flight at that instant. An operator who restarts the service while an `xvd` CLI download is running
+> would have its `.tmp-xvd-*` directory deleted underneath it — corrupting a download this service
+> does not own and never knew about.
+>
+> **The sweep therefore removes only directories whose mtime is older than `XVD_JOB_TIMEOUT`.** No
+> download of ours can legitimately be older than that, because the watchdog fails it at exactly that
+> age, so anything older is certainly abandoned. A younger directory is left alone and swept on some
+> later restart — one interval of wasted disk in exchange for removing the failure mode entirely.
+>
+> Single-process (Assumption 5) is an assumption about *this service*, not about the machine. The CLI
+> shipped in feature 001 and shares the output directory by design.
+
 ---
 
 ## D8 — Handle generation

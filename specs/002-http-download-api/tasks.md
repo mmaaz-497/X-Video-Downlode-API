@@ -18,7 +18,7 @@ description: "Task list for 002-http-download-api — Phase 1 (US1 + US3), Phase
 | Phase 2 | US2 | — | not generated |
 | Phase 3 | US4 | T029–T043 | code complete; **T043 awaits the owner** |
 | Phase 4 | US5 | T044–T050 | code complete; **T049 awaits the owner** |
-| Phase 5 | US6 | — | not generated |
+| **Phase 5** | **US6** | **T051–T060** | **generated below** |
 
 All three outstanding tasks are the 🚦 manual verifications, which the owner runs. Nothing else is
 open.
@@ -413,7 +413,7 @@ Named so that their absence reads as a decision rather than an oversight:
 | Full per-code message refinement | FR-010, FR-011 | US2 / plan Phase 2 | not generated |
 | Disk guard, rate limit, `XVD_MAX_PENDING`, job time limit + watchdog | FR-018, FR-019, FR-020, FR-015 cap | US4 / plan Phase 3 | **built, T029–T042** |
 | Retention sweep, `expired` transition | FR-021, FR-022, FR-023 | US5 / plan Phase 4 | **built, T044–T048** |
-| Restart recovery, temp-directory sweep | FR-024 (read side), FR-025, FR-026 | US6 / plan Phase 5 | not generated |
+| Restart recovery, temp-directory sweep | FR-024 (read side), FR-025, FR-026 | US6 / plan Phase 5 | **now T051–T060** |
 | Wedged-worker mitigation | — | **Never.** Accepted limitation, ADR-0002 | never |
 | Docker, nginx, systemd, TLS | — | Out of scope by the spec | never |
 
@@ -1016,3 +1016,290 @@ US2 (per-code message refinement) and US6 (restart recovery, temp sweep). US6 is
 specifically: **T044's persistence writes an `expired` state that nothing yet reads back**, exactly as
 T004 wrote records nothing read. That is the same deliberate anticipation, and US6 is where it is
 finally collected.
+
+---
+---
+
+# Plan Phase 5 (US6) — restart recovery
+
+**Generated 2026-08-15.** Tasks **T051–T060**. The last functional gap in the feature.
+
+Everything T004 deferred is collected here. Three prior tasks wrote state that nothing has ever read
+back — T004's job records, T035's terminal transitions, T044's `expired` marks — and this phase is
+where the write side finally acquires its reader.
+
+---
+
+## Decisions recorded before the breakdown
+
+### 1. Authority: disk wins for the length of `recover()`, memory wins forever after
+
+Research D3 already settles the steady state — *"the in-memory dict is authoritative for the life of
+the process. Disk is a crash-recovery record, read exactly once during start-up and never read
+again."* What it does not say is what happens **during** recovery, which is the only moment the two
+can disagree. The rule for this phase:
+
+```text
+   before recover()   registry is empty; disk is the only truth
+   during recover()   disk is read; memory is built from it; any record recovery
+                      CHANGES is written back before the function returns
+   after recover()    memory is authoritative; disk is a write-only mirror
+```
+
+**The load-bearing clause is the middle one.** A job recovered as `failed`/`interrupted` must be
+persisted *inside* `recover()`, not left for some later transition — otherwise a second crash before
+the next write would resurrect it as `running` again, and it could ping-pong indefinitely.
+
+**T056 asserts this as a property, not a hope**: after `recover()` returns, every record on disk
+deserialises to a job equal to the one in the registry. That is the requirement "a record on disk and
+the in-memory registry must not disagree" turned into something that can fail.
+
+### 2. A record we cannot trust is skipped, logged, and counted — never guessed at
+
+Four ways a file under `<state_dir>/jobs/` can be unusable, and all four get the same treatment:
+
+| Case | Why not "repair" it |
+|---|---|
+| Truncated or invalid JSON | A half-written record has no correct interpretation. `os.replace` makes this nearly impossible, but "nearly" is not a reason to crash on it. |
+| Missing a required field | Same. |
+| `handle` field ≠ the filename stem, or not handle-shaped | Nothing we wrote can produce this, so the state directory has been edited or corrupted. A record that disagrees with its own name is not evidence of anything. |
+| A `state` string we do not recognise | Most likely a **downgrade** — a record written by a later version. Interrupting it would mislabel it; skipping loses one job and keeps the rest. |
+
+**Start-up must not fail because one file is bad.** One unreadable record costs one job; a crash-loop
+costs the service. Logged at WARNING with the filename, and a single summary line with the count, so
+"three records were skipped" is greppable rather than buried.
+
+### 3. FR-026's temp sweep needs an age threshold — this corrects research D7
+
+D7 justifies the temp-directory sweep like this:
+
+> *"Safe at start-up specifically because the service is single-process (Assumption 5) and nothing is
+> downloading yet. Note the CLI could in principle be running concurrently; the sweep is therefore
+> start-up-only and never periodic, so it cannot delete a live CLI download's temp directory."*
+
+**The last clause does not follow.** Being start-up-only limits *how often* the sweep runs; it does
+nothing to prevent a CLI download being in flight at that instant. An operator who restarts the
+service while a `xvd` CLI download is running would have its `.tmp-xvd-*` directory deleted underneath
+it — corrupting a download the service does not own and never knew about.
+
+**Resolution (T054): only remove a `.tmp-xvd-*` directory whose mtime is older than
+`XVD_JOB_TIMEOUT`.** No download of ours can legitimately outlive that — the watchdog fails it at
+exactly that age — so anything older is certainly abandoned. A CLI download younger than the job
+timeout is left alone and swept on some later restart, which costs one interval of disk and removes
+the whole failure mode.
+
+This is a correction to a planning document, so it goes into research.md as a dated note rather than
+a silent edit, exactly as the D9 proxy-header correction did.
+
+### 4. Interrupted jobs are not requeued, and the reason is in the spec
+
+FR-025 as resolved by Q3: *"Interrupted jobs MUST NOT be requeued automatically."* A restart is
+frequently a deploy or an OOM kill, and a service that re-ran every in-flight download on boot would
+turn one bad deploy into a thundering herd against X. The caller is told plainly and resubmits if
+they still want it — `FAILURE_MESSAGES[INTERRUPTED]` already says "Submit it again to retry."
+
+### 5. Recovery is called once, from the lifespan, before anything else can observe the registry
+
+`init()` → `recover()` → start the sweep task → `yield`. Ordering matters twice over: the sweep must
+not run against a half-built registry, and uvicorn must not accept a connection until recovery is
+done. The second is free — uvicorn completes lifespan startup before binding to traffic — but it is
+asserted rather than assumed, because "free because of what a dependency happens to do" is exactly
+the kind of guarantee that quietly stops being true.
+
+---
+
+## Phase 13: US6 service layer — `backend/jobs.py` (Priority: P3)
+
+**Goal**: a process that starts up knowing what the previous one was doing.
+
+**Independent Test**: `tests/test_jobs.py` writes records to a state directory, calls `recover()`, and
+inspects the registry — no restart, no subprocess, no HTTP.
+
+All six tasks edit `backend/jobs.py` and run in sequence.
+
+- [ ] **T051** [US6] Add `_from_record(data, expected_handle) -> Job | None` to `backend/jobs.py`.
+  - The exact inverse of `_as_record` (`backend/jobs.py:358`). `files` comes back as a list of
+    strings and MUST become `tuple(Path(...))` — the same type `DownloadOutcome.paths` produces, or
+    `file_for` will be comparing the wrong thing.
+  - Returns `None` for every untrustworthy case in decision 2, rather than raising: a per-file
+    failure is expected input at this boundary, not an exception (Principle VI).
+  - Validate `data["handle"] == expected_handle` **and** `is_valid_handle(...)`. Nothing this service
+    writes can violate either, so a violation means the state directory was edited.
+  - Reject a `state` not in the five constants.
+  - `timed_out` is deliberately absent from the record (T035) — default it to `False`. A restart ends
+    the process that could have been timing out.
+
+- [ ] **T052** [US6] Implement `recover()` in `backend/jobs.py` — the read side of FR-024.
+  - Iterate `<state_dir>/jobs/*.json`, skipping the `.tmp-job-*` files `persist` may have left behind
+    (`backend/jobs.py:401`). Those are half-written by definition and must never be parsed.
+  - Build the registry from what parses. Log one WARNING per skipped file and one summary line with
+    the count (decision 2).
+  - **Call once, from the lifespan, and never from `init()`.** `init()` is called repeatedly by
+    tests and by nothing else in production; making it read the disk would give every test a
+    surprise registry.
+  - A missing or empty jobs directory is a normal first start, not an error.
+  - `recover()` returns a count of what it loaded, so T057 can log one line an operator can read on
+    boot rather than leaving start-up silent about it.
+
+- [ ] **T053** [US6] Resolve non-terminal recovered jobs in `backend/jobs.py` (FR-025).
+  - Any record read as `waiting` or `running` → `failed` with `failure_code=INTERRUPTED`, and
+    **persisted before `recover()` returns** (decision 1). The code and its caller-safe sentence
+    already exist (`backend/jobs.py:FAILURE_MESSAGES`); this is the first thing that assigns it.
+  - Use `_enter_terminal`, which sets `completed_at` and refuses a job already terminal — no second
+    transition path.
+  - **Do not requeue** (decision 4, FR-025/Q3). No `_executor.submit` anywhere in this phase.
+  - `downloaded_bytes` and `total_bytes` from the record are stale by definition; leave them as read.
+    They are never shown for a terminal job (`backend/api.py:_as_response` only reports progress
+    while `running`).
+  - An `expired` record keeps its `files` list, so a delete that failed on Windows before the restart
+    is retried by the first sweep of the new process. That continuity is free and worth a comment —
+    it is the one place where recovery and T046's retry meet.
+
+- [ ] **T054** [US6] Sweep abandoned `.tmp-xvd-*` directories in `backend/jobs.py` (FR-026).
+  - Match `.tmp-xvd-*` directories directly under `_output_dir` — the prefix
+    `backend/downloader.py:493` uses. Directories only; never touch a file at that level, which would
+    be somebody's video.
+  - **Only those with an mtime older than `XVD_JOB_TIMEOUT`** (decision 3). Write the reasoning at
+    the code: no download of ours can outlive the watchdog, so an older directory is certainly
+    abandoned, and a younger one may belong to a CLI run this service does not own.
+  - `shutil.rmtree` with the failure **tolerated and logged**, exactly as T046 and
+    `backend/downloader.py:270-292` do it. A leftover directory that cannot be removed is a disk
+    issue, not a reason to refuse to start.
+  - **Start-up only. Never added to `sweep()`.** State why in the code, or a later reader will
+    reasonably wonder why this one piece of cleanup sits apart from all the others.
+  - **research.md D7 already carries the dated correction** — it was made while planning this phase
+    rather than left for implementation, since the flaw was known the moment it was found. Read it
+    before writing the threshold; do not re-derive the number.
+
+- [ ] **T055** [US6] Confirm recovered `finished` jobs are still retrievable, in `backend/jobs.py`.
+  - Mostly an assertion that nothing extra is needed: `file_for` re-checks existence
+    (`backend/jobs.py:733-735`) and reports `expired` when a file is gone, which is the correct answer
+    for a file an operator deleted between runs.
+  - What IS needed is the `tuple[Path, ...]` round-trip from T051. A `files` list left as strings
+    would make `chosen.is_file()` fail with `AttributeError` on the first retrieval after a restart —
+    a bug that no test before this phase could have caught, because nothing ever read a record back.
+  - If anything beyond the type conversion turns out to be required, **stop and report**: it would
+    mean the record shape is lossy, which is a data-model problem rather than a coding one.
+
+- [ ] **T056** [US6] Extend `tests/test_jobs.py` for recovery.
+  - **The reconciliation property (decision 1)**: after `recover()`, every file in the jobs directory
+    deserialises to a job equal to the registry's. This is the "must not disagree" requirement made
+    falsifiable.
+  - `waiting` and `running` records both become `failed`/`interrupted`, with `completed_at` set.
+  - **The record on disk says `failed` too** — not just memory. Assert by re-reading the file, which
+    is what catches the ping-pong failure decision 1 describes.
+  - A `finished` record round-trips: state preserved, `files` are `Path` objects, and `file_for`
+    returns the real path.
+  - An `expired` record stays `expired` and keeps its files for the retry.
+  - Each of the four untrustworthy cases in decision 2 is skipped without raising, and the survivors
+    still load. Include a `.tmp-job-*` leftover and assert it is ignored.
+  - Recovery is a no-op on an empty or absent jobs directory.
+  - **Nothing is requeued**: recovery with a `waiting` record submits no work. Assert against the
+    executor, not by observing that nothing happened to download.
+  - Temp sweep: a `.tmp-xvd-*` directory older than the timeout is removed; one younger is **kept**;
+    a plain file with a similar name is untouched; and an rmtree failure does not propagate.
+
+**Checkpoint**: `uv run pytest` passes. A process can be handed a state directory and reconstruct
+what the last one was doing. `backend/api.py` is still unchanged by this phase.
+
+---
+
+## Phase 14: US6 transport — `backend/api.py` (Priority: P3)
+
+- [ ] **T057** [US6] Call `recover()` from the lifespan in `backend/api.py`, before anything else.
+  - Order: `jobs.init()` → `jobs.recover()` → `asyncio.create_task(_sweep_loop())` → `yield`
+    (decision 5). The sweep must not run against a half-built registry.
+  - Log one line with the recovered count, so a boot is not silent about having adopted state.
+  - **`recover()` is synchronous and does filesystem work.** It runs directly in the lifespan rather
+    than via `to_thread` — deliberately, because blocking start-up is exactly what we want here and
+    the event loop has nothing else to serve yet. Say so at the code; it looks inconsistent with
+    `_sweep_loop` otherwise.
+  - This is the whole transport change. If more is needed, **stop and report**.
+
+---
+
+## Phase 15: Verification and close
+
+- [ ] **T058** [US6] Assert recovery completes before the service can be observed, in
+  `tests/test_jobs.py`.
+  - Structural, since this file may not construct an HTTP client: parse `api.py`, find `lifespan`,
+    and assert `jobs.recover()` is called **before** `create_task` and before the `yield`.
+  - This is decision 5's second half. The guarantee currently rests on uvicorn completing lifespan
+    startup before accepting connections, which is true and is *not ours* — so what we can own is the
+    ordering inside our own function, and that is what gets asserted.
+  - Confirm the existing boundary tests still hold: `jobs.py` imports no framework, `api.py` has no
+    loop outside `_sweep_loop`, and `_sweep_loop` still touches no job data.
+
+- [ ] **T059** 🚦 **STOP. Manual verification of US6 — the owner runs this.**
+  - Start a real download, then **`kill -9`** the service mid-transfer — no graceful shutdown, or the
+    thing being tested does not happen.
+  - Restart. Then confirm:
+    - `GET /jobs/<handle>` reports **`failed`** with `failure.code == "interrupted"`, **never**
+      `running` (FR-025);
+    - no `.tmp-xvd-*` directory survives in the output directory (FR-026) — check after the restart,
+      and remember T054's age threshold means a *fresh* one is kept by design, so wait past
+      `XVD_JOB_TIMEOUT` or set it low for the test;
+    - a job that had **finished** before the kill still reports `finished` and its file still
+      downloads intact (US6 acceptance scenario 3);
+    - the interrupted job was **not** restarted — nothing is downloading after the boot.
+  - Kill it a second time immediately after the first recovery and restart again: the job must still
+    read `failed`/`interrupted`, not flip back to `running`. That is decision 1's ping-pong, and it is
+    the one failure a single restart cannot reveal.
+  - Record results inline in this file.
+
+- [ ] **T060** Close the feature out.
+  - **Verify**: `git diff --stat 3a3918e HEAD -- backend/downloader.py backend/validation.py backend/config.py`
+    prints nothing. Standing instruction, same backstop as T024 and T050.
+  - `uv run pytest` green; `git diff pyproject.toml uv.lock` empty; `tests/` still holds exactly three
+    files.
+  - Update this document's scope table: every phase generated is then code-complete, with only the
+    three 🚦 manual verifications (T027, T043, T049, T059) outstanding.
+  - Note in `plan.md` that Phase 5 is delivered and US2 is the only story never built.
+
+---
+
+## Dependencies & Execution Order (T051–T060)
+
+```text
+T051 (parse one record)
+  └─> T052 (read the directory) ──> T053 (resolve non-terminal) ──> T054 (temp sweep)
+        └─> T055 (finished still retrievable) ──> T056 (tests)
+              └─> T057 (lifespan wiring)          [Phase 14]
+                    └─> T058 ──> T059  🚦 STOP ──> T060   [Phase 15]
+```
+
+**Hard sequencing rules**:
+
+- **T051 blocks everything.** Nothing can be read back until one record can be.
+- **T051 → T056 are strictly sequential**: all in `backend/jobs.py`.
+- **T053 must land with T052, not after it.** A `recover()` that loads `running` jobs and leaves them
+  running is worse than no recovery at all — it produces exactly the permanently-misleading job
+  FR-025 exists to prevent, and it would look like it worked.
+- **T054 implements a correction research.md already records.** The document was fixed at planning
+  time; the code must match the threshold it now states rather than a freshly invented one.
+- **T058 must not be folded into T057.** The ordering guarantee is the point of the phase's second
+  half; asserting it in the same task that writes it invites asserting what was written rather than
+  what was required.
+
+### Parallel Opportunities
+
+None. Six of the ten tasks edit `backend/jobs.py`, and the remaining four are strictly ordered behind
+them. No `[P]` markers in this phase, and adding any would be decorative.
+
+---
+
+## Implementation Strategy
+
+One sitting. The phase is small and every task depends on its predecessor; there is no useful
+intermediate state where half of recovery is shipped.
+
+### Suggested commit points
+
+After T056 (the service layer, complete and tested) and after T058. T059 is the owner's, and T060 is
+the close-out commit.
+
+### What remains after T060
+
+**US2 only** — per-code message refinement (FR-010, FR-011). Worth stating plainly: the *mechanism*
+shipped in Phase 1 and the drift test in T014 pins it, so what US2 would add is better sentences, not
+new capability. The feature is functionally complete at T060.
