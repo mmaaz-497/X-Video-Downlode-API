@@ -51,6 +51,7 @@ ENV_MIN_FREE_BYTES = "XVD_MIN_FREE_BYTES"
 ENV_RATE_LIMIT = "XVD_RATE_LIMIT"
 ENV_RATE_WINDOW = "XVD_RATE_WINDOW"
 ENV_SWEEP_INTERVAL = "XVD_SWEEP_INTERVAL"
+ENV_LOG_LEVEL = "XVD_LOG_LEVEL"
 
 _log = logging.getLogger("xvd.jobs")
 
@@ -147,6 +148,80 @@ def _non_negative_int(name: str, default: int) -> int:
     setting it to 1 byte and meaning the same thing less clearly.
     """
     return _int_env(name, default, minimum=0)
+
+
+# The package's whole logger namespace. Both modules log beneath it
+# (xvd.jobs, xvd.api), so configuring this one name configures all of them and
+# touches nothing else -- uvicorn's own three loggers are left exactly as
+# uvicorn set them up.
+LOGGER_NAMESPACE = "xvd"
+
+# Timestamp and logger name are both required rather than decorative. Without
+# them the wedged-worker warning arrives as a bare sentence on stderr, with
+# nothing to say when it happened or which part of the service said it.
+_LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+
+_LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+_DEFAULT_LOG_LEVEL = "INFO"
+
+# Marks the handler as ours, so a second call adopts it instead of stacking a
+# duplicate. Reloads, tests, and a lifespan that runs twice would otherwise each
+# add one and every line would print as many times as start-up had happened.
+_HANDLER_TAG = "xvd-default-handler"
+
+
+def configure_logging(stream=None) -> logging.Logger:
+    """Give the xvd namespace a handler, so its records are actually emitted.
+
+    Without this the package logs into silence above WARNING. uvicorn's
+    dictConfig sets up exactly three loggers -- uvicorn, uvicorn.access,
+    uvicorn.error -- and ours is not among them, so `xvd.*` reaches no handler
+    at all and falls through to logging.lastResort, whose level is WARNING.
+    Every _log.info in this package was therefore invisible in production,
+    including the line in _record_outcome that carries the downloader's raw
+    message. That line IS the FR-033 correlation between the code a caller sees
+    and the reason behind it, so it silently failing to appear was the whole
+    requirement silently failing.
+
+    Deliberately NOT logging.basicConfig or dictConfig: both reach past this
+    package. basicConfig configures the root logger, and dictConfig would
+    replace the configuration uvicorn installed for its own loggers. A handler
+    on one namespace is the smallest thing that works.
+
+    `propagate` is left True on purpose, even though it means a line appears
+    twice for an operator who has also configured the root logger. The
+    alternative -- propagate=False, guaranteeing exactly one line -- also cuts
+    the records off from every capture mechanism attached at root, including
+    pytest's caplog and any log shipper an operator has already set up. Losing
+    a line is worse than printing it twice.
+
+    Idempotent: calling it again re-reads the level and reuses the handler.
+    """
+    level = os.environ.get(ENV_LOG_LEVEL, _DEFAULT_LOG_LEVEL).strip().upper()
+    if level not in _LOG_LEVELS:
+        # Same posture as _int_env: name a configuration mistake at start-up
+        # rather than acting on it. Falling back rather than raising, because an
+        # unreadable log level must not be the thing that stops the service.
+        logging.getLogger(f"{LOGGER_NAMESPACE}.jobs").warning(
+            "XVD_LOG_LEVEL=%r is not one of %s; using %s",
+            level,
+            ", ".join(_LOG_LEVELS),
+            _DEFAULT_LOG_LEVEL,
+        )
+        level = _DEFAULT_LOG_LEVEL
+
+    logger = logging.getLogger(LOGGER_NAMESPACE)
+    logger.setLevel(level)
+
+    for existing in logger.handlers:
+        if getattr(existing, "name", None) == _HANDLER_TAG:
+            return logger
+
+    handler = logging.StreamHandler(stream)  # stderr, where diagnostics belong
+    handler.name = _HANDLER_TAG
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    logger.addHandler(handler)
+    return logger
 
 
 def init() -> None:

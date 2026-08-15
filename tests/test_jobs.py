@@ -11,7 +11,9 @@ per Principle II's "plain fakes and stub objects only, if anything".
 """
 
 import ast
+import io
 import json
+import logging
 import os
 import re
 import time
@@ -1467,6 +1469,166 @@ def test_a_removal_that_fails_does_not_stop_start_up(service, caplog):
 
     assert stuck.exists()
     assert any("could not remove leftover" in record.message for record in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# Operator logging (FR-033)
+#
+# The one requirement in the spec phrased as "available to the OPERATOR" rather
+# than as something a caller receives -- and the only one that shipped broken,
+# because every other check in this file reads a record or a response. These
+# read what a human would see instead.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def pristine_logging():
+    """Snapshot and restore the xvd logger.
+
+    A logger is process-global. Without this, a test that sets the level to
+    ERROR would silence the caplog assertions in the sections above, and the
+    failure would look like a logic bug in retention rather than leakage
+    between tests -- the same trap the `service` fixture exists for.
+    """
+    logger = logging.getLogger(jobs.LOGGER_NAMESPACE)
+    handlers = list(logger.handlers)
+    level = logger.level
+    try:
+        yield logger
+    finally:
+        logger.handlers = handlers
+        logger.setLevel(level)
+
+
+def test_the_xvd_namespace_has_a_handler_after_start_up(pristine_logging):
+    """The regression guard.
+
+    This gap did not exist because someone removed a handler; it existed
+    because nobody ever added one, and nothing noticed for three phases. An
+    assertion that a handler is present is the cheapest thing that would have
+    noticed.
+    """
+    pristine_logging.handlers = []
+    jobs.configure_logging()
+
+    assert pristine_logging.handlers, "the xvd namespace has no handler"
+    assert pristine_logging.level == logging.INFO
+
+
+def test_info_is_the_default_so_an_operator_configures_nothing(pristine_logging, monkeypatch):
+    monkeypatch.delenv("XVD_LOG_LEVEL", raising=False)
+    pristine_logging.handlers = []
+    jobs.configure_logging()
+
+    assert logging.getLogger("xvd.jobs").getEffectiveLevel() == logging.INFO
+    assert logging.getLogger("xvd.api").getEffectiveLevel() == logging.INFO
+
+
+def test_the_record_outcome_message_reaches_the_log(service, pristine_logging):
+    """FR-033 itself: the caller's code and the operator's reason, correlated.
+
+    The caller is told "This post does not contain a video." The operator needs
+    the downloader's own sentence AND the handle, or a support conversation has
+    nothing to join them on. This is the line whose invisibility was the bug.
+    """
+    stream = io.StringIO()
+    pristine_logging.handlers = []
+    jobs.configure_logging(stream)
+
+    raw = "this post has no video in it."
+    job = _accept(service, download=_stub(status="failed", message=raw))
+    _await_terminal(job)
+
+    written = stream.getvalue()
+    assert raw in written, "the downloader's message never reached the operator"
+    assert job.handle in written, "nothing correlates the line to the caller's job"
+
+    # And the boundary still holds in the other direction: what the CALLER gets
+    # is the fixed sentence, never this text.
+    assert jobs.FAILURE_MESSAGES[job.failure_code] != raw
+
+
+def test_every_line_carries_a_timestamp_and_the_logger_name(pristine_logging):
+    """The wedged-worker warning used to arrive as a bare sentence on stderr."""
+    stream = io.StringIO()
+    pristine_logging.handlers = []
+    jobs.configure_logging(stream)
+
+    logging.getLogger("xvd.jobs").warning("xvd-wedged-worker: job ABC is stuck")
+    line = stream.getvalue().strip()
+
+    assert "xvd.jobs" in line
+    assert "WARNING" in line
+    assert "xvd-wedged-worker: job ABC is stuck" in line
+    # An ISO-ish date at the front -- 2026-08-15 10:11:12,345
+    assert re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", line), line
+
+
+def test_the_level_is_operator_configurable(pristine_logging, monkeypatch):
+    monkeypatch.setenv("XVD_LOG_LEVEL", "warning")  # case-insensitive
+    pristine_logging.handlers = []
+    jobs.configure_logging()
+
+    assert pristine_logging.level == logging.WARNING
+
+
+def test_an_unreadable_level_falls_back_to_info_rather_than_refusing_to_start(
+    pristine_logging, monkeypatch, caplog
+):
+    """A typo in a log level must not be the thing that stops the service."""
+    monkeypatch.setenv("XVD_LOG_LEVEL", "chatty")
+    pristine_logging.handlers = []
+
+    with caplog.at_level("WARNING", logger="xvd.jobs"):
+        jobs.configure_logging()
+
+    assert pristine_logging.level == logging.INFO
+    assert any("XVD_LOG_LEVEL" in record.message for record in caplog.records)
+
+
+def test_configuring_twice_does_not_duplicate_the_handler(pristine_logging):
+    """A reload, a second lifespan, or a test calling it again would otherwise
+    print every line as many times as start-up had happened."""
+    pristine_logging.handlers = []
+    jobs.configure_logging()
+    jobs.configure_logging()
+    jobs.configure_logging()
+
+    ours = [h for h in pristine_logging.handlers if getattr(h, "name", None) == jobs._HANDLER_TAG]
+    assert len(ours) == 1
+
+
+def test_uvicorns_own_loggers_are_left_alone(pristine_logging):
+    """Not our namespace, not our business. Replacing uvicorn's formatter or
+    handlers would change output the operator already knows how to read."""
+    import uvicorn.config
+
+    before = {
+        name: (list(logging.getLogger(name).handlers), logging.getLogger(name).level)
+        for name in uvicorn.config.LOGGING_CONFIG["loggers"]
+    }
+    pristine_logging.handlers = []
+    jobs.configure_logging()
+
+    for name, (handlers, level) in before.items():
+        assert logging.getLogger(name).handlers == handlers, f"{name} was modified"
+        assert logging.getLogger(name).level == level, f"{name}'s level was modified"
+
+    # And the root logger, which basicConfig would have configured.
+    assert logging.getLogger().handlers == logging.getLogger().handlers
+
+
+def test_records_still_propagate_so_capture_tooling_keeps_working(pristine_logging):
+    """propagate stays True deliberately.
+
+    Setting it False would guarantee exactly one line per record, but would also
+    cut the records off from anything attached at root -- pytest's caplog, and
+    any log shipper an operator has already configured. The three caplog
+    assertions elsewhere in this file are the local proof that this matters.
+    """
+    pristine_logging.handlers = []
+    jobs.configure_logging()
+    assert pristine_logging.propagate is True
 
 
 # --------------------------------------------------------------------------

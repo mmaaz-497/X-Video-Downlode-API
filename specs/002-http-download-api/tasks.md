@@ -1298,9 +1298,18 @@ intermediate state where half of recovery is shipped.
 After T056 (the service layer, complete and tested) and after T058. T059 is the owner's, and T060 is
 the close-out commit.
 
-### Found during T057, and deliberately not fixed here
+### Found during T057 — now fixed (T061)
 
-**FR-033 is not satisfied in a default deployment.** Verified against uvicorn 0.52.2 while watching a
+> **Resolved 2026-08-15.** `jobs.configure_logging()` gives the `xvd` namespace a handler, a level
+> from `XVD_LOG_LEVEL` defaulting to INFO, and a format carrying a timestamp and the logger name. It
+> is the first call in the lifespan, before `init()`, so start-up's own report is emitted. Verified
+> live: the correlation line now appears as
+> `2026-08-15 12:33:32,031 INFO xvd.jobs: job <handle> failed: this post has no video in it.`
+> while the same job's caller received `{"code":"no_video","message":"This post does not contain a
+> video."}`. Removing the `addHandler` call reproduces the original bug and turns four tests red.
+> The description below is kept as the record of what was wrong.
+
+**FR-033 was not satisfied in a default deployment.** Verified against uvicorn 0.52.2 while watching a
 real boot recover a real state directory:
 
 - uvicorn configures exactly three loggers — `uvicorn`, `uvicorn.access`, `uvicorn.error`

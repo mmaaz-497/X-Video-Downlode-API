@@ -166,6 +166,7 @@ Every value has a working default, per Principle VII. Read once at start-up.
 | `XVD_MIN_FREE_BYTES` | `2147483648` (2 GB) | FR-018 |
 | `XVD_RATE_LIMIT` | `10` | FR-019, submissions per window per address |
 | `XVD_RATE_WINDOW` | `3600` (1 h) | FR-019 |
+| `XVD_LOG_LEVEL` | `INFO` | **FR-033.** The level at which the failure/handle correlation line is written. Below `INFO` that line is lost, and with it the operator's only route from a caller's code to the real reason. |
 
 `config.py` is frozen, so these are read in `jobs.py` via `os.environ` — the same pattern
 `config.output_dir` uses, not an extension of it.

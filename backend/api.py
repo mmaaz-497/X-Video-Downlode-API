@@ -66,6 +66,10 @@ async def lifespan(_app: FastAPI):
 
     The order is the requirement, not a preference:
 
+    0. configure_logging() -- FIRST, or every line the rest of start-up writes
+       goes nowhere. Recovery reports what it adopted and what it refused to
+       read, and that report is worthless if it is emitted before anything can
+       emit it;
     1. init() -- configuration and the state directory must exist first;
     2. recover() -- BEFORE the sweep task, which would otherwise run against a
        half-built registry, and before yield, so nothing can be served from a
@@ -83,6 +87,7 @@ async def lifespan(_app: FastAPI):
     point here: there is nothing else for the loop to serve yet, and start-up
     must not proceed without it.
     """
+    jobs.configure_logging()
     jobs.init()
 
     recovered = jobs.recover()
