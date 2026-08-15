@@ -41,10 +41,9 @@ from backend.validation import parse_post_url
 # read here with os.environ -- the same pattern config.output_dir uses, not an
 # extension of it.
 #
-# XVD_RETENTION is the one row of data-model.md's table still absent: it belongs
-# to the retention sweep and is added with it. Reading a variable the service
-# does not act on would advertise configuration that does nothing.
+# Every row of data-model.md's configuration table is now read here.
 ENV_STATE_DIR = "XVD_STATE_DIR"
+ENV_RETENTION = "XVD_RETENTION"
 ENV_MAX_CONCURRENT = "XVD_MAX_CONCURRENT"
 ENV_MAX_PENDING = "XVD_MAX_PENDING"
 ENV_JOB_TIMEOUT = "XVD_JOB_TIMEOUT"
@@ -66,6 +65,11 @@ _DEFAULT_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 _DEFAULT_RATE_LIMIT = 10
 _DEFAULT_RATE_WINDOW = 3600  # 1 hour
 _DEFAULT_SWEEP_INTERVAL = 900  # 15 minutes
+# Measured from the job's completion, not from the file's age on disk. A job
+# that finished instantly by reusing a file an earlier CLI run left behind gets
+# a full period from ITS completion, so handing someone a file and deleting it
+# moments later cannot happen (spec.md:213-216).
+_DEFAULT_RETENTION = 86400  # 24 hours
 
 # Set by init(). Module-level rather than passed around because there is exactly
 # one of each per process, and threading them through every call would be
@@ -80,6 +84,7 @@ _min_free_bytes: int = _DEFAULT_MIN_FREE_BYTES
 _rate_limit: int = _DEFAULT_RATE_LIMIT
 _rate_window: int = _DEFAULT_RATE_WINDOW
 _sweep_interval: int = _DEFAULT_SWEEP_INTERVAL
+_retention: int = _DEFAULT_RETENTION
 _executor: ThreadPoolExecutor | None = None
 
 # address -> submission timestamps still inside the window (research D9).
@@ -155,7 +160,7 @@ def init() -> None:
     """
     global _output_dir, _state_dir, _jobs_dir, _max_concurrent
     global _max_pending, _job_timeout, _min_free_bytes
-    global _rate_limit, _rate_window, _sweep_interval
+    global _rate_limit, _rate_window, _sweep_interval, _retention
 
     # No argument. The frozen config.output_dir accepts an override for the CLI's
     # --output-dir flag; passing anything here would put the destination one
@@ -186,6 +191,7 @@ def init() -> None:
     _rate_limit = _positive_int(ENV_RATE_LIMIT, _DEFAULT_RATE_LIMIT)
     _rate_window = _positive_int(ENV_RATE_WINDOW, _DEFAULT_RATE_WINDOW)
     _sweep_interval = _positive_int(ENV_SWEEP_INTERVAL, _DEFAULT_SWEEP_INTERVAL)
+    _retention = _positive_int(ENV_RETENTION, _DEFAULT_RETENTION)
 
     # Zero is a valid instruction here and nowhere else above -- see
     # _non_negative_int.
@@ -322,6 +328,30 @@ def _enter_terminal(
     job.completed_at = time.time()
     job.failure_code = failure_code
     job.files = files
+    return True
+
+
+def _expire(job: Job) -> bool:
+    """Move a FINISHED job to EXPIRED. The only terminal-to-terminal transition.
+
+    Returns False when the job was not finished, so the caller can tell "marked"
+    from "not applicable" rather than assuming.
+
+    Deliberately a SECOND function rather than a flag on _enter_terminal.
+    Invariant 1 in data-model.md says a terminal state is never left, with this
+    as its single exception; teaching _enter_terminal to make an exception would
+    mean the guard could be talked into leaving a terminal state, and it stops
+    being the guard the watchdog race needs it to be. Two functions, one of
+    which permits exactly one edge, keeps that property intact.
+
+    `files` is NOT cleared. The deletion that follows needs the paths, and on
+    Windows it may need them again on the next sweep. A caller sees only the
+    count, and file_for refuses on state before it looks at the tuple at all.
+    Caller must hold _lock.
+    """
+    if job.state != FINISHED:
+        return False
+    job.state = EXPIRED
     return True
 
 
@@ -1028,6 +1058,87 @@ def _run_watchdog(moment: float) -> None:
             )
 
 
+def _delete_files(job: Job, unlink: Callable[[Path], None]) -> None:
+    """Remove an expired job's files, tolerating a delete that cannot happen yet.
+
+    On Windows a file being read cannot be unlinked -- the open handle makes it
+    a PermissionError -- and the development machine is Windows while the
+    deployment target is not. This is the same problem _remove_temp_dir
+    documents at downloader.py:270-292, and it gets the same answer: log it,
+    leave the file, and let the next sweep try again.
+
+    The tolerance is safe rather than merely convenient because the caller-
+    visible guarantee does not depend on the delete succeeding. The job is
+    already EXPIRED by the time this runs, so file_for refuses on state and no
+    caller can reach these bytes whether or not they are still on disk. What is
+    at stake is disk space, and disk space can wait one interval.
+
+    Logged at WARNING, not swallowed: a file that fails to delete on every pass
+    forever is a real leak, and the operator needs to be able to see it.
+    """
+    for path in job.files:
+        try:
+            unlink(path)
+        except FileNotFoundError:
+            # Already gone -- a previous pass, or an operator. Nothing to do and
+            # nothing worth saying.
+            pass
+        except OSError:
+            _log.warning(
+                "job %s: a retained file could not be deleted yet; "
+                "the next sweep will retry",
+                job.handle,
+                exc_info=True,
+            )
+
+
+def _expire_due(moment: float, unlink: Callable[[Path], None]) -> None:
+    """Expire finished jobs past their retention period (FR-021, FR-022, FR-023).
+
+    MARK FIRST, DELETE SECOND. The ordering is the requirement, not a tidiness
+    preference:
+
+    * A retrieval that begins after the mark is refused with a clean "expired"
+      rather than racing a file that is vanishing underneath it.
+    * A retrieval already in flight keeps its open file handle. On POSIX,
+      unlink removes the directory entry while the reader goes on reading, so
+      the response completes intact -- which is why marking first is sufficient
+      and no lock is held across the transfer.
+
+    Reversing these two lines would produce exactly the failure FR-023 exists to
+    prevent: a caller mid-download receiving a truncated file.
+
+    Jobs already EXPIRED are revisited so that a delete which failed on an
+    earlier pass is retried. That is the whole of the retry mechanism -- no
+    extra state, because "still expired and the file still exists" is already
+    the complete description of what needs doing.
+    """
+    cutoff = moment - _retention
+
+    with _lock:
+        due = [
+            job
+            for job in _registry.values()
+            if job.state == FINISHED
+            and job.completed_at is not None
+            and job.completed_at <= cutoff
+        ]
+        newly_expired = [job for job in due if _expire(job)]
+
+        # Anything expired whose files are still on disk, including the jobs
+        # just marked and any whose deletion failed before.
+        pending_deletion = [
+            job for job in _registry.values() if job.state == EXPIRED and job.files
+        ]
+
+    for job in newly_expired:
+        persist(job)
+        _log.info("job %s expired after its retention period", job.handle)
+
+    for job in pending_deletion:
+        _delete_files(job, unlink)
+
+
 def _prune_rate_buckets(moment: float) -> None:
     """Drop buckets that have gone empty, so one-off callers cannot grow the dict.
 
@@ -1045,7 +1156,15 @@ def _prune_rate_buckets(moment: float) -> None:
                 del _rate_buckets[address]
 
 
-def sweep(*, now: Callable[[], float] = time.time) -> None:
+def _unlink(path: Path) -> None:
+    path.unlink()
+
+
+def sweep(
+    *,
+    now: Callable[[], float] = time.time,
+    unlink: Callable[[Path], None] = _unlink,
+) -> None:
     """One maintenance pass. Safe to call at any time; does nothing if idle.
 
     Order matters and is not alphabetical:
@@ -1061,11 +1180,14 @@ def sweep(*, now: Callable[[], float] = time.time) -> None:
     twice.
 
     `now` is the clock seam, so an entire retention period can pass inside a
-    test without any of it elapsing.
+    test without any of it elapsing. `unlink` is the same kind of seam for the
+    delete, so the Windows file-handle failure can be exercised on any platform
+    rather than only where it happens to occur.
     """
     _require_init()
     moment = now()
     _run_watchdog(moment)
+    _expire_due(moment, unlink)
     _prune_rate_buckets(moment)
 
 

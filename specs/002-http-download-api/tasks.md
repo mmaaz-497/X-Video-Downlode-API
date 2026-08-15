@@ -14,11 +14,14 @@ description: "Task list for 002-http-download-api — Phase 1 (US1 + US3), Phase
 
 | Plan phase | Stories | Tasks | State |
 |---|---|---|---|
-| Phase 1 | US1 + US3 | T001–T028 | complete but for T027 |
+| Phase 1 | US1 + US3 | T001–T028 | code complete; **T027 awaits the owner** |
 | Phase 2 | US2 | — | not generated |
-| **Phase 3** | **US4** | **T029–T043** | **generated below** |
-| **Phase 4** | **US5** | **T044–T050** | **generated below** |
+| Phase 3 | US4 | T029–T043 | code complete; **T043 awaits the owner** |
+| Phase 4 | US5 | T044–T050 | code complete; **T049 awaits the owner** |
 | Phase 5 | US6 | — | not generated |
+
+All three outstanding tasks are the 🚦 manual verifications, which the owner runs. Nothing else is
+open.
 
 US2 and US6 are deliberately absent, by instruction. See *Explicitly Not In This Document*.
 
@@ -408,8 +411,8 @@ Named so that their absence reads as a decision rather than an oversight:
 | Deferred | Requirements | Belongs to | Status |
 |---|---|---|---|
 | Full per-code message refinement | FR-010, FR-011 | US2 / plan Phase 2 | not generated |
-| Disk guard, rate limit, `XVD_MAX_PENDING`, job time limit + watchdog | FR-018, FR-019, FR-020, FR-015 cap | US4 / plan Phase 3 | **now T029–T043** |
-| Retention sweep, `expired` transition | FR-021, FR-022, FR-023 | US5 / plan Phase 4 | **now T044–T050** |
+| Disk guard, rate limit, `XVD_MAX_PENDING`, job time limit + watchdog | FR-018, FR-019, FR-020, FR-015 cap | US4 / plan Phase 3 | **built, T029–T042** |
+| Retention sweep, `expired` transition | FR-021, FR-022, FR-023 | US5 / plan Phase 4 | **built, T044–T048** |
 | Restart recovery, temp-directory sweep | FR-024 (read side), FR-025, FR-026 | US6 / plan Phase 5 | not generated |
 | Wedged-worker mitigation | — | **Never.** Accepted limitation, ADR-0002 | never |
 | Docker, nginx, systemd, TLS | — | Out of scope by the spec | never |
@@ -864,7 +867,7 @@ created; `/health` answers.
 **Independent Test**: complete a job, hand `sweep()` a `now` past the retention period, confirm the
 file is gone, the job reports `expired`, and `file_for` refuses.
 
-- [ ] **T044** [US5] Add `XVD_RETENTION` and the `finished → expired` transition to `backend/jobs.py`.
+- [X] **T044** [US5] Add `XVD_RETENTION` and the `finished → expired` transition to `backend/jobs.py`.
   - `XVD_RETENTION` (default 86400) via `_positive_int`, read in `init()` beside the others.
   - `_enter_terminal` **refuses** this transition — `FINISHED` is in `_TERMINAL_STATES`
     (`backend/jobs.py:225-226`) — and that refusal is correct for every other caller. Add a separate
@@ -876,7 +879,7 @@ file is gone, the job reports `expired`, and `file_for` refuses.
   - `_expire` must **not** clear `job.files`. T046's retry needs the paths, and a caller sees only
     the count regardless.
 
-- [ ] **T045** [US5] Add the retention pass to `sweep()` in `backend/jobs.py` (FR-021, FR-023).
+- [X] **T045** [US5] Add the retention pass to `sweep()` in `backend/jobs.py` (FR-021, FR-023).
   - Between the watchdog and the bucket prune, per T036's ordering comment.
   - Every `FINISHED` job whose `completed_at + XVD_RETENTION` has passed, measured with the injected
     `now`: **mark `expired` and persist first, then attempt deletion** (FR-023, research D7).
@@ -889,7 +892,7 @@ file is gone, the job reports `expired`, and `file_for` refuses.
     finished instantly by reusing a file an earlier CLI run left behind gets a full retention period
     from *its* completion (spec.md:213-216).
 
-- [ ] **T046** [US5] Tolerate a delete that fails, in `backend/jobs.py`.
+- [X] **T046** [US5] Tolerate a delete that fails, in `backend/jobs.py`.
   - On Windows the `unlink` raises `PermissionError` while a reader holds the file open. **Log at
     debug and move on**; the next sweep tries again. This is the same reasoning
     `_remove_temp_dir` documents at `backend/downloader.py:270-292`, for the same underlying cause —
@@ -901,7 +904,7 @@ file is gone, the job reports `expired`, and `file_for` refuses.
   - A file deleted out from under the service by an operator is already handled: `file_for` re-checks
     existence and reports `expired` (`backend/jobs.py:733-735`). Do not add a second path.
 
-- [ ] **T047** [US5] Extend `tests/test_jobs.py` for retention. Still no `time.sleep`.
+- [X] **T047** [US5] Extend `tests/test_jobs.py` for retention. Still no `time.sleep`.
   - A job finished longer ago than the retention period is `expired` by `sweep(now=...)`, its file is
     gone, and `file_for` returns the `expired` problem.
   - A job finished **within** the period is untouched: state, file, and record all unchanged
@@ -919,7 +922,7 @@ file is gone, the job reports `expired`, and `file_for` refuses.
 
 ## Phase 12: US5 close-out and verification
 
-- [ ] **T048** [US5] Confirm — by assertion, not by assumption — that US5 needs no transport change.
+- [X] **T048** [US5] Confirm — by assertion, not by assumption — that US5 needs no transport change.
   - `backend/api.py` already returns **410** `expired` for an expired job
     (`backend/api.py:337-338`), and `file_for` already reports the `EXPIRED` problem
     (`backend/jobs.py:702-703`). Both were written in T019 against a state that could not yet occur.

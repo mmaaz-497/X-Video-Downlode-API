@@ -61,6 +61,11 @@ existing one.
    exception of `finished → expired`. A worker that returns after the watchdog already failed its job
    MUST NOT overwrite the record — the check is explicit, because with a wedged thread (D4) this is a
    race that really happens.
+
+   **Implemented as two functions, not one with an exception.** `_enter_terminal` refuses every
+   departure from a terminal state; `_expire` permits exactly the `finished → expired` edge and
+   nothing else. Teaching `_enter_terminal` to make an exception would have made it a guard that can
+   be argued with, and the watchdog race is precisely the case where it must not be.
 2. `started_at` is set exactly once, by the worker, before any other work.
 3. `completed_at` is set on entry to any terminal state.
 4. `failure_code` is non-`None` if and only if `state == "failed"`.

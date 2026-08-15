@@ -12,6 +12,7 @@ per Principle II's "plain fakes and stub objects only, if anything".
 
 import ast
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -914,6 +915,245 @@ def test_health_reports_counts_and_nothing_identifying(service):
 
 
 # --------------------------------------------------------------------------
+# Retention (US5: FR-021, FR-022, FR-023)
+#
+# Same rule as the section above: no time.sleep. A whole retention period passes
+# by handing sweep() a different clock. The delete is a seam too, so the Windows
+# file-handle failure can be exercised on any platform rather than only where it
+# happens to occur.
+# --------------------------------------------------------------------------
+
+
+def test_finished_job_past_retention_is_expired_and_its_file_deleted(service, tmp_path):
+    job, files = _finished(service, tmp_path)
+    clock = _clock(job.completed_at)
+
+    clock.advance(service._retention + 1)
+    service.sweep(now=clock)
+
+    assert job.state == jobs.EXPIRED
+    assert not files[0].exists()
+    assert service.file_for(job).problem == jobs.EXPIRED
+
+
+def test_job_inside_the_retention_period_is_untouched(service, tmp_path):
+    """US5 acceptance scenario 2: state, file, and record all unchanged."""
+    job, files = _finished(service, tmp_path)
+    clock = _clock(job.completed_at)
+
+    clock.advance(service._retention - 1)
+    service.sweep(now=clock)
+
+    assert job.state == jobs.FINISHED
+    assert files[0].exists()
+    assert service.file_for(job).path == files[0]
+
+
+def test_expired_is_distinguishable_from_failed(service, tmp_path):
+    """FR-022. A caller who came back too late has not had a failure."""
+    job, _ = _finished(service, tmp_path)
+    clock = _clock(job.completed_at)
+    clock.advance(service._retention + 1)
+    service.sweep(now=clock)
+
+    assert job.state == jobs.EXPIRED
+    assert job.state != jobs.FAILED
+    # Invariant 4: failure_code is set if and only if the state is failed.
+    assert job.failure_code is None
+
+
+def test_retention_is_measured_from_completion_not_file_age(service, tmp_path):
+    """spec.md:213-216. A job that finished instantly by reusing a file an
+    earlier CLI run left behind still gets a full period from ITS completion."""
+    old_file = tmp_path / "out" / "left-over.mp4"
+    old_file.parent.mkdir(parents=True, exist_ok=True)
+    old_file.write_bytes(b"downloaded last week")
+    os.utime(old_file, (0, 0))  # ancient on disk
+
+    job = _accept(service, download=_stub(old_file, status="skipped"))
+    _await_terminal(job)
+
+    clock = _clock(job.completed_at)
+    clock.advance(service._retention - 1)
+    service.sweep(now=clock)
+
+    assert job.state == jobs.FINISHED
+    assert old_file.exists()
+
+
+@pytest.mark.parametrize("state", ["waiting", "running", "failed"])
+def test_only_finished_jobs_are_ever_expired(service, state):
+    """However old they are. Expiry is about a file that exists to delete."""
+    job = jobs.Job(
+        handle=jobs._mint_handle(), canonical_url=BARE_URL, client_address="203.0.113.7"
+    )
+    job.state = state
+    job.completed_at = 0.0  # as old as it gets
+    job.started_at = 0.0
+    service._registry[job.handle] = job
+
+    service.sweep(now=lambda: service._retention * 100)
+
+    # The claim is about expiry specifically. A `running` job IS legitimately
+    # changed by this sweep -- the watchdog fails it -- so asserting the state
+    # is unchanged would be either wrong or vacuous depending on the case. What
+    # must hold for all three is that none of them became `expired`.
+    assert job.state != jobs.EXPIRED
+    if state != "running":
+        assert job.state == state
+
+
+def test_the_expired_record_survives_a_read(service, tmp_path):
+    """Mark-before-delete has to be durable, not only in memory."""
+    job, _ = _finished(service, tmp_path)
+    clock = _clock(job.completed_at)
+    clock.advance(service._retention + 1)
+    service.sweep(now=clock)
+
+    on_disk = json.loads((service._jobs_dir / f"{job.handle}.json").read_text())
+    assert on_disk["state"] == "expired"
+
+
+# --- Mark-before-delete, and the tolerated Windows delete (FR-023) ---------
+
+
+def test_the_mark_happens_before_the_delete(service, tmp_path):
+    """FR-023's ordering, observed rather than assumed.
+
+    The unlink seam checks the job's state at the moment it is called. If the
+    delete ran first, the state would still be `finished` here -- and a caller
+    who asked for the file in that window would be handed a path to a file that
+    was disappearing, which is precisely the truncated-response failure the
+    requirement exists to prevent.
+    """
+    job, _ = _finished(service, tmp_path)
+    observed = []
+
+    def watching_unlink(path):
+        observed.append(job.state)
+        path.unlink()
+
+    clock = _clock(job.completed_at)
+    clock.advance(service._retention + 1)
+    service.sweep(now=clock, unlink=watching_unlink)
+
+    assert observed == [jobs.EXPIRED], "the file was deleted before the job was marked"
+
+
+def test_a_retrieval_that_started_first_is_not_cut_off(service, tmp_path):
+    """A reader holding the file must finish reading it.
+
+    On POSIX, unlink removes the directory entry while an open handle goes on
+    working, so a response already streaming completes intact. On Windows the
+    unlink fails instead, which the sweep tolerates -- and the reader likewise
+    finishes. Both platforms end with the reader whole; only the disk differs.
+    """
+    job, files = _finished(service, tmp_path)
+    expected = files[0].read_bytes()
+
+    clock = _clock(job.completed_at)
+    clock.advance(service._retention + 1)
+
+    # The retrieval resolves its path BEFORE the sweep runs -- the window
+    # FR-023 is about.
+    resolved = service.file_for(job).path
+    assert resolved is not None
+
+    with open(resolved, "rb") as reader:
+        first = reader.read(4)
+
+        def platform_unlink(path):
+            try:
+                path.unlink()
+            except PermissionError:
+                # Windows, with the handle above still open. Tolerated.
+                pass
+
+        service.sweep(now=clock, unlink=platform_unlink)
+
+        # The reader carries on regardless of which platform this is.
+        rest = reader.read()
+
+    assert first + rest == expected
+    assert job.state == jobs.EXPIRED
+
+
+def test_a_delete_that_fails_is_tolerated_and_retried(service, tmp_path, caplog):
+    """The Windows file-handle case, exercised on any platform.
+
+    The sweep must not crash, the job must be expired anyway, and the failure
+    must be VISIBLE -- a file that fails to delete on every pass forever is a
+    real leak, and swallowing it silently would hide that.
+    """
+    job, files = _finished(service, tmp_path)
+    clock = _clock(job.completed_at)
+    clock.advance(service._retention + 1)
+
+    def refusing_unlink(path):
+        raise PermissionError(32, "The process cannot access the file")
+
+    with caplog.at_level("WARNING", logger="xvd.jobs"):
+        service.sweep(now=clock, unlink=refusing_unlink)
+
+    assert job.state == jobs.EXPIRED
+    assert files[0].exists()  # still there; the delete really did fail
+    assert any("could not be deleted yet" in record.message for record in caplog.records)
+
+    # The next pass retries, with no extra state needed to remember to.
+    attempts = []
+    service.sweep(now=clock, unlink=lambda path: attempts.append(path) or path.unlink())
+    assert attempts == [files[0]]
+    assert not files[0].exists()
+
+
+def test_a_file_already_gone_is_not_reported_as_a_problem(service, tmp_path, caplog):
+    """An operator deleted it, or a previous pass did. Nothing to say."""
+    job, files = _finished(service, tmp_path)
+    files[0].unlink()
+
+    clock = _clock(job.completed_at)
+    clock.advance(service._retention + 1)
+    with caplog.at_level("WARNING", logger="xvd.jobs"):
+        service.sweep(now=clock, unlink=_unlink_for_test)
+
+    assert job.state == jobs.EXPIRED
+    assert not [r for r in caplog.records if "could not be deleted" in r.message]
+
+
+def _unlink_for_test(path):
+    path.unlink()
+
+
+def test_expire_refuses_any_transition_other_than_from_finished(service):
+    """The one exception to invariant 1 must stay exactly one exception."""
+    job = jobs.Job(
+        handle=jobs._mint_handle(), canonical_url=BARE_URL, client_address="203.0.113.7"
+    )
+
+    for state in (jobs.WAITING, jobs.RUNNING, jobs.FAILED, jobs.EXPIRED):
+        job.state = state
+        assert service._expire(job) is False
+        assert job.state == state
+
+    job.state = jobs.FINISHED
+    assert service._expire(job) is True
+    assert job.state == jobs.EXPIRED
+
+
+def test_enter_terminal_still_refuses_to_leave_a_terminal_state(service, tmp_path):
+    """_expire is a second function precisely so this stays true.
+
+    If expiry had been added as a flag on _enter_terminal, the guard the
+    watchdog race depends on would have become one that can be talked into
+    leaving a terminal state.
+    """
+    job, _ = _finished(service, tmp_path)
+    with jobs._lock:
+        assert jobs._enter_terminal(job, jobs.EXPIRED) is False
+    assert job.state == jobs.FINISHED
+
+
+# --------------------------------------------------------------------------
 # The Principle III boundary (T025)
 #
 # Feature 001 checked this with `grep -nE "argparse|sys\.exit|print\("` and the
@@ -1075,6 +1315,39 @@ def test_the_exempt_loop_iterates_over_time_and_not_over_jobs():
     }
     assert "asyncio.to_thread" in called
     assert "asyncio.sleep" in called
+
+
+def test_the_transport_still_handles_the_expired_state():
+    """Retention adds no code to api.py, and this is what makes that a result
+    rather than an oversight.
+
+    T019 wrote the 410 branch against a state that could not occur yet -- there
+    was no retention, so nothing could ever be `expired`. Now something can. A
+    branch that looks unreachable is a branch someone deletes while tidying, so
+    the reachability is asserted here rather than left to be inferred.
+
+    Structural, because this file may not construct an HTTP client (Principle
+    III). What it can prove is that the branch exists and names the right state;
+    that `file_for` produces that problem for an expired job is proved by the
+    retention tests above, and the two together close the path.
+    """
+    serve = _functions(_parse("api.py"))["_serve"]
+
+    attributes = {
+        node.attr for node in ast.walk(serve) if isinstance(node, ast.Attribute)
+    }
+    assert "EXPIRED" in attributes, "api.py no longer branches on the expired state"
+
+    statuses = {
+        node.args[0].value
+        for node in ast.walk(serve)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_error"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
+    assert 410 in statuses, "the expired refusal is no longer a 410 (FR-022)"
 
 
 def test_frozen_modules_are_not_imported_for_writing():

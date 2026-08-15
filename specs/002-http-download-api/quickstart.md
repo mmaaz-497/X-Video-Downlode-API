@@ -155,6 +155,45 @@ curl -s localhost:8000/health
 the accepted limitation in ADR-0002, not a bug to chase — but it must be **visible**, which is why
 the count exists. The operator log line to grep for is `xvd-wedged-worker`.
 
+## Retention (US5)
+
+```bash
+XVD_RETENTION=60 XVD_SWEEP_INTERVAL=10 uv run uvicorn backend.api:app &
+# complete a real download, then wait past the retention period plus one sweep
+curl -s localhost:8000/jobs/<handle>
+# → {"state":"expired",…}   distinct from "failed" (FR-022)
+curl -s -w ' <- %{http_code}\n' localhost:8000/jobs/<handle>/file
+# → {"code":"expired","message":"This file has expired…"} <- 410
+ls "$XVD_OUTPUT_DIR"   # → the video is gone (FR-021)
+```
+
+A job that finished **seconds ago** must be untouched by the same sweep. Check both in one run, or
+the test only proves that the sweep deletes things.
+
+### Mark-before-delete, observed rather than reasoned about (FR-023)
+
+This is the one check that needs a large file and a little timing:
+
+```bash
+# with a job whose file is big enough to take longer than a sweep interval:
+curl -s -o retrieved.mp4 localhost:8000/jobs/<handle>/file &
+# let the sweep fire mid-transfer, then:
+wait
+cmp retrieved.mp4 "$XVD_OUTPUT_DIR"/<original>   # → identical, or the original is
+                                                 #   already gone and the size matches
+```
+
+The retrieval must complete intact. On Linux, `unlink` removes the directory entry while the open
+handle keeps working, so the response finishes and the file disappears afterwards. **On Windows the
+delete fails instead** — expected, tolerated, and it must appear in the operator log:
+
+```bash
+grep 'could not be deleted yet' <server log>   # → present on Windows, absent on Linux
+```
+
+The following sweep must then succeed in deleting it. A warning that repeats on **every** pass
+forever is a real leak and worth investigating; one or two is the file-handle case resolving itself.
+
 ## Restart recovery (US6, later phase)
 
 ```bash
