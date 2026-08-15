@@ -15,13 +15,14 @@ description: "Task list for 002-http-download-api — Phase 1 (US1 + US3), Phase
 | Plan phase | Stories | Tasks | State |
 |---|---|---|---|
 | Phase 1 | US1 + US3 | T001–T028 | **complete** — T027 verified by the owner 2026-08-15 |
-| **Phase 2** | **US2** | **T061–T067** | **generated below** |
-| Phase 3 | US4 | T029–T043 | **complete** — T043 verified by the owner 2026-08-15 |
-| Phase 4 | US5 | T044–T050 | **complete** — T049 verified 2026-08-15; T050 close-out open |
-| Phase 5 | US6 | T051–T060 | **complete** — T059 verified 2026-08-15; T060 close-out open |
+| Phase 2 | US2 | T061–T067 | code complete; **T066 awaits the owner**, T067 blocked on it |
+| Phase 3 | US4 | T029–T043 | ✅ **complete** — T043 verified, T050 closed 2026-08-15 |
+| Phase 4 | US5 | T044–T050 | ✅ **complete** — T049 verified, T050 closed 2026-08-15 |
+| Phase 5 | US6 | T051–T060 | ✅ **complete** — T059 verified, T060 closed 2026-08-15 |
 
-**Every 🚦 manual verification generated so far has passed** (T027, T043, T049, T059 — all
-2026-08-15). Open: the two close-out tasks T050 and T060, and all of Phase 2 (T061–T067).
+**Four of the five 🚦 manual verifications have passed** (T027, T043, T049, T059 — all 2026-08-15),
+and T050 and T060 are closed. **Open: T066 and T067.** A consolidated *Limitation register* at the
+end of this document lists every accepted limitation and untested path across both features.
 
 Every phase in the plan now has tasks. The deferral register below records what was excluded and
 when it was picked up.
@@ -1012,7 +1013,7 @@ file is gone, the job reports `expired`, and `file_for` refuses.
   the tolerance each turn a test red (see the T045/T046 notes) — so what remains unobserved by hand is
   the timing bound rather than the behaviour.
 
-- [ ] **T050** Close both phases out.
+- [X] **T050** Close both phases out.
   - **Verify**: `git diff --stat HEAD -- backend/downloader.py backend/validation.py backend/config.py`
     prints nothing. Same standing instruction, same backstop as T024 — if a task above needed one of
     these, **stop and report** rather than editing.
@@ -1023,6 +1024,31 @@ file is gone, the job reports `expired`, and `file_for` refuses.
     `test_downloader.py`, and `test_jobs.py`.
   - Update this document's scope table and the *Explicitly Not In This Document* table so US4 and US5
     read as done and only US2 and US6 remain.
+
+  ### T050 close-out — 2026-08-15 ✅
+
+  | Check | Result |
+  |---|---|
+  | Frozen modules unchanged since `3a3918e` | **empty diff** |
+  | `uv run pytest` | **302 passed**, T039's amended AST checks included |
+  | Dependencies | **unchanged** since `cd5d970`; `yt-dlp`, `fastapi`, `uvicorn` only |
+  | Test files | three — `test_validation.py`, `test_downloader.py`, `test_jobs.py` |
+  | Scope tables | updated |
+
+  **Phase 3 (US4) verified by T043**, **Phase 4 (US5) verified by T049**, both by the owner on
+  2026-08-15 — results recorded under those tasks.
+
+  #### What these two phases ship with, and what has never been exercised
+
+  - **US4's watchdog frees the caller, not the thread.** A hung `ffmpeg` merge holds a worker until
+    restart. Accepted, not solved — see the limitation register at the end of this document.
+  - **Not exercised by hand in T043**: the ten-simultaneous-submission SC-006 run, the
+    five-concurrent-duplicates SC-007 run, rate-limit recovery after the window elapses, and the
+    `time_limit` path with its temp-directory cleanup. All are covered by tests and mutation; none
+    has been watched against a live service.
+  - **Not exercised by hand in T049**: a recently finished job surviving the same sweep, the
+    mark-before-delete ordering observed mid-transfer, and SC-009's retention-plus-one-interval
+    bound. The first two are mutation-verified; the timing bound is unobserved.
 
 ---
 
@@ -1338,7 +1364,7 @@ what the last one was doing. `backend/api.py` is still unchanged by this phase.
   against a live boot over a staged crash state (a `finished` record served a 200 with the right
   bytes; `test_recovery_does_not_requeue_anything` asserts the second against the executor).
 
-- [ ] **T060** Close the feature out.
+- [X] **T060** Close the feature out.
   - **Verify**: `git diff --stat 3a3918e HEAD -- backend/downloader.py backend/validation.py backend/config.py`
     prints nothing. Standing instruction, same backstop as T024 and T050.
   - `uv run pytest` green; `git diff pyproject.toml uv.lock` empty; `tests/` still holds exactly three
@@ -1346,6 +1372,30 @@ what the last one was doing. `backend/api.py` is still unchanged by this phase.
   - Update this document's scope table: every phase generated is then code-complete, with only the
     🚦 manual verifications passed (T027, T043, T049, T059 — all 2026-08-15).
   - Note in `plan.md` that Phase 5 is delivered and US2 is the only story never built.
+
+  ### T060 close-out — 2026-08-15 ✅
+
+  | Check | Result |
+  |---|---|
+  | Frozen modules unchanged since `3a3918e` | **empty diff** |
+  | `uv run pytest` | **302 passed** |
+  | Dependencies | **unchanged** |
+  | Test files | three |
+
+  **Phase 5 (US6) verified by T059**, by the owner on 2026-08-15 — results under that task. The check
+  that carries the phase is the **second** kill: one restart proves recovery ran, but cannot
+  distinguish a verdict written to disk from one that lived in memory and died with the process.
+
+  #### What US6 ships with
+
+  - **A fresh `.tmp-xvd-*` directory survives start-up by design.** The sweep removes only directories
+    older than `XVD_JOB_TIMEOUT`, because the CLI shares the output directory and may be mid-download
+    when the service restarts. An operator expecting a spotless directory immediately after a boot is
+    seeing correct behaviour, not a leak. See the limitation register.
+  - **Not exercised by hand in T059**: that a job which had *finished* before the kill still serves
+    its file, and that nothing resumed downloading on boot. Both were verified during T057 against a
+    live boot over a staged crash state, and the second is asserted against the executor by
+    `test_recovery_does_not_requeue_anything`.
 
 ---
 
@@ -1702,6 +1752,30 @@ classification in decision 1 is the pass criterion, and T064 encodes the parts o
     five phases are delivered.
   - **This is the last task in the feature.**
 
+  ### T067 — mechanical checks done 2026-08-15, **task deliberately left open**
+
+  | Check | Result |
+  |---|---|
+  | Frozen modules unchanged since `3a3918e` | **empty diff** |
+  | `uv run pytest` | **302 passed** |
+  | T014's four assertions | **unedited and green** — no key moved |
+  | Dependencies | **unchanged** |
+  | Test files | three |
+
+  > ⛔ **T067 is not complete, because T066 has not been run.** Every other phase's close-out records
+  > a manual verification that actually happened; this one would be recording one that did not.
+  >
+  > The gap is specific and worth naming rather than glossing: **`not_a_video` has never been
+  > triggered against a real post.** Its reachability is established from source
+  > (`twitter.py:1351`/`:1359` and the frozen `parse_post_url` accepting `/photo/<n>`), which is
+  > strong evidence but not the same as having seen it. T066 exists to close exactly that, by
+  > submitting an indexed URL naming a photo. The same is true of the three-post code-distinctness
+  > run and the SC-004 same-code-twice check.
+  >
+  > US2's *code* is complete and its properties are tested and mutation-verified. What is missing is
+  > the human half — reading nine sentences cold and answering "should I try again?" — which no test
+  > can perform. Mark this task complete once T066's results are recorded above.
+
 ---
 
 ## Dependencies & Execution Order (T061–T067)
@@ -1737,3 +1811,122 @@ and T062 — the audit and the two factual corrections — and the rest is finis
 
 After T063 (the table, corrected and complete) and after T065. T066 is the owner's; T067 closes the
 feature.
+
+---
+---
+
+# Limitation register
+
+**Consolidated 2026-08-15 during close-out.** Every item below was already recorded somewhere — the
+problem was that "somewhere" meant seven different documents, and an operator hitting one of these at
+2am has no way to know which. This is the single durable list; each row points at the full reasoning
+rather than restating it.
+
+Nothing here is a defect to be fixed later by default. Each was **decided**, and the decision is what
+this register preserves.
+
+## 1. A hung `ffmpeg` merge wedges a worker thread until restart
+
+**Feature 002 · US4 · accepted, will not be fixed as designed**
+
+After the transfer completes, yt-dlp merges audio and video by calling `Popen.run` with **no
+timeout** (`yt_dlp/postprocessor/ffmpeg.py:356` → `communicate_or_kill(timeout=None)`). Progress hooks
+have already stopped, and post-processing reports through a `postprocessor_hooks` list the frozen
+`_base_options` does not populate — so nothing we can reach fires, and nothing raises.
+
+**What we do**: the deadline watchdog fails the *job* on schedule, so no caller waits forever. The
+*thread* cannot be freed — Python threads cannot be killed — so capacity drops by one until restart.
+
+**How an operator sees it**: `wedged_workers` on `GET /health` goes above zero and `status` reads
+`degraded`; the log carries a greppable `xvd-wedged-worker` line. A restart is the only cure, and the
+count returning to zero on restart is correct rather than a reset.
+
+**The fix we did not take**: `ProcessPoolExecutor`, which solves it completely at the cost of moving
+progress across a process boundary and re-importing the package per worker under Windows `spawn`. A
+re-plan, not a patch.
+
+→ research.md D4 · plan.md Complexity Tracking ·
+[ADR-0002](../../history/adr/0002-off-event-loop-job-execution-and-concurrency-control.md)
+
+## 2. "Images but no video" is indistinguishable from "no media at all"
+
+**Feature 001 · FR-004 / US2 · a limit of the extractor, not of our code**
+
+For a **bare** post URL, yt-dlp filters photos out at `twitter.py:1349`
+(`lambda _, m: m['type'] != 'photo'`) and never reports what it removed, so an image-only post and a
+text-only post both arrive as `No video could be found in this tweet` (`:1377`). The distinction is
+available **only** when the URL carries an explicit `/photo/<n>` or `/video/<n>` index.
+
+**What we do**: `no_video`'s sentence — *"This post does not contain a video."* — is deliberately
+silent about images, because any mention would be a claim the service cannot support. US2 added
+`test_no_message_mentions_images` so a future edit cannot reintroduce it while trying to be helpful.
+
+**Recovering it would** require inspecting the pre-filter media list, which `extract_info` does not
+expose, and modifying `downloader.py`, which is frozen.
+
+→ feature 001 research D6 · feature 001 plan.md:176 · data-model.md `FailureCode` · T061 audit
+
+## 3. Windows leaves a temp directory behind on an interrupted download
+
+**Feature 001 · US1 · platform behaviour, tolerated on both sides**
+
+Deleting a file another process still holds open raises `PermissionError` (WinError 32) on Windows.
+`_remove_temp_dir` (`downloader.py:270-292`) therefore retries rather than using
+`shutil.rmtree(ignore_errors=True)`, which would swallow the failure and leave a `.tmp-xvd-*`
+directory with nothing said about it. When Ctrl+C unwinds, yt-dlp has not necessarily released its
+own files — its fragment pool shuts down with `wait=False`, and Windows delivers Ctrl+C to `ffmpeg`
+as a process-group event concurrently with our unwinding.
+
+**What feature 002 adds**: a start-up sweep (FR-026) that removes abandoned directories — but **only
+those older than `XVD_JOB_TIMEOUT`**. A fresh one surviving a restart is deliberate: the CLI shares
+the output directory and may be mid-download, and deleting its temp directory would corrupt a
+download this service does not own.
+
+**So an operator may legitimately see a `.tmp-xvd-*` directory** immediately after an interrupt or a
+restart. It is swept on a later start-up, not never.
+
+→ `downloader.py:270-292` · research.md D7 (with its 2026-08-15 correction) · T054
+
+## 4. The `playlist_items` multi-video path has never executed
+
+**Feature 001 · the largest untested path in the codebase**
+
+`backend/downloader.py:508` sets `options["playlist_items"] = str(position)` only when a post contains
+more than one video. **No test and no manual run has ever taken that branch**, because it requires a
+real multi-video post. Everything downstream of it is equally unexercised in practice: per-entry
+format selection under `playlist_items`, the `-1`/`-2` filename suffixes, and the partial-failure
+composition that appends `Files already saved: …`.
+
+**Why feature 002 does not close this**: the HTTP layer calls `download_post` and formats its result;
+it inherits the path without exercising it. `file_for`'s multi-file branches *are* tested — with
+synthetic file lists — so the service layer handles a multi-file outcome correctly **given** one. What
+has never been observed is the frozen downloader producing one.
+
+**The visible consequence if it is broken**: a multi-video post either fails, or produces a
+`file_count` that disagrees with what is on disk. A caller would see `index_required` naming a count.
+
+→ feature 001 tasks.md:207-210, :268, :554
+
+## 5. An out-of-range media index reports `unclassified`
+
+**Feature 002 · US2 · known, fixing it needs a new failure code**
+
+`twitter.py:1357` raises `Video #<n> is unavailable` for an index past the end of a post's media. That
+string matches no needle in `downloader._ERROR_DIAGNOSES`, so it falls to the generic branch and the
+caller is told *"The download failed for an unexpected reason."* — truthful, unhelpful.
+
+A specific code would move `FAILURE_PREFIXES`, `_classify`, and T014's coverage assertions, which US2
+was explicitly scoped out of touching.
+
+→ T061 audit · data-model.md `FailureCode`
+
+## 6. Rate-limit state is lost on restart
+
+**Feature 002 · US4 · deliberate**
+
+The buckets are in memory only, so every caller gets a fresh allowance immediately after a restart.
+Persisting them would put a disk write on the hot submission path to defend against an attacker who
+would need to be able to restart the service to exploit it — and anyone who can do that has already
+won.
+
+→ research.md D9 · `backend/jobs.py` `_rate_buckets`

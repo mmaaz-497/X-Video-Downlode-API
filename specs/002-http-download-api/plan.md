@@ -174,6 +174,30 @@ delete failure on Windows.
 
 **Phase 5 — US6**: start-up recovery to `failed`/`interrupted` and the `.tmp-xvd-*` sweep.
 
+### Delivery status (2026-08-15)
+
+**All five phases are delivered.** Every story in the spec is built, and the whole of it was written
+without modifying `downloader.py`, `validation.py`, or `config.py` — verified by an empty diff against
+`3a3918e`, the commit at which they entered this feature's history.
+
+| Phase | Story | Tasks | Built | Verified by hand |
+|---|---|---|---|---|
+| 1 | US1 + US3 | T001–T028 | ✅ | ✅ T027 |
+| 2 | US2 | T061–T067 | ✅ | ⛔ **T066 not run** |
+| 3 | US4 | T029–T043 | ✅ | ✅ T043 |
+| 4 | US5 | T044–T050 | ✅ | ✅ T049 |
+| 5 | US6 | T051–T060 | ✅ | ✅ T059 |
+
+302 tests pass. Two dependencies were added across the whole feature, both named in this plan:
+`fastapi` and plain `uvicorn`. No database, queue, cache, scheduler, or mocking framework.
+
+**One requirement shipped broken and was repaired after Phase 5**: FR-033's diagnostic correlation was
+written but never reached a human, because uvicorn configures only its own three loggers and the `xvd`
+namespace had no handler. Fixed by `jobs.configure_logging()`; see tasks.md.
+
+**Accepted limitations and untested paths are consolidated** in the *Limitation register* at the end
+of [tasks.md](./tasks.md), rather than being scattered across the documents that first recorded them.
+
 ## Complexity Tracking
 
 No Constitution Check gate failed, so no justification is required.
